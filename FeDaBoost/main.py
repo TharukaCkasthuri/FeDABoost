@@ -28,8 +28,8 @@ from enum import Enum
 
 import torch
 
-from clients import Client, BoostingClient
-from server import Server, OptimaServer
+from clients import Client, BoostingClient, DittoClient
+from server import Server, OptimaServer, DittoServer
 from utils import get_device, get_client_ids
 
 from models.kv import ShallowNN
@@ -62,10 +62,10 @@ def setup_logging(stratergy,dataset, timestamp):
 
 def parse_arguments():
     parser = argparse.ArgumentParser(description="Federated training parameters")
-    parser.add_argument("--dataset", type=dataset_enum, default="femnist", help="Choose a dataset from the available options; femnist, mnist, kv")
-    parser.add_argument("--data_dir", type=str, default="datasets/femnist/", help="Path to the data directory, expected to have train and test directories with names trainpt and testpt respectively." )
+    parser.add_argument("--dataset", type=dataset_enum, default="mnist", help="Choose a dataset from the available options; femnist, mnist, kv")
+    parser.add_argument("--data_dir", type=str, default="datasets/mnist/", help="Path to the data directory, expected to have train and test directories with names trainpt and testpt respectively." )
     parser.add_argument("--loss_function", type=str, default="FocalLoss", help="Choose a loss function from the available options; CrossEntropyLoss, FocalLoss, HybridLoss")
-    parser.add_argument("--stratergy", type=str, default="fedavg", help="Choose a federated learning stratergy from the available options; fedavg, fedprox, fedaboost")
+    parser.add_argument("--stratergy", type=str, default="ditto", help="Choose a federated learning stratergy from the available options; fedavg, fedprox, fedaboost")
     parser.add_argument("--log_summary", action="store_true")
     parser.add_argument("--global_rounds", type=int, default=50)
     parser.add_argument("--local_rounds", type=int, default=5)
@@ -147,6 +147,26 @@ class Federation:
                     self.weight_decay,
                     local_model=self.model,
                 ))
+
+        elif stratergy == "ditto":
+            self.server = DittoServer(global_rounds, stratergy, checkpt_path=checkpt_path)
+            self.server.init_model(model)
+
+            for id in client_ids:
+                self.server.connect_client(
+                    DittoClient(
+                        client_id=id,
+                        train_dataset=torch.load(f"{train_data_dir}/{id}.pt"),
+                        test_dataset=torch.load(f"{test_data_dir}/{id}.pt"),
+                        loss_fn=self.loss_fn,
+                        batch_size=self.batch_size,
+                        learning_rate=self.learning_rate,
+                        weight_decay=self.weight_decay,
+                        local_model=self.model,
+                        personal_learning_rate=self.learning_rate, 
+                        ditto_lambda=0.2            
+                    )
+                )
         else:
                 raise ValueError(f"Invalid stratergy. Choose from: {', '.join([stratergy.value for stratergy in Stratergy])}")
 
@@ -258,7 +278,7 @@ if __name__ == "__main__":
         loss_fn = getattr(torch.nn, args.loss_function)()
     
     log_summary = args.log_summary
-    checkpt_path = f"checkpt/{stratergy}/{dataset.name}/optimized_dynamic_epochs/epoch_{epochs}/{global_rounds}_rounds_{local_rounds}_epochs_per_round/"
+    checkpt_path = f"checkpt/{stratergy}/{dataset.name}/test_withk/epoch_{epochs}/{global_rounds}_rounds_{local_rounds}_epochs_per_round/"
     client_ids = get_client_ids(train_data_dir)
 
     if args.dataset == Dataset.FEMNIST:
