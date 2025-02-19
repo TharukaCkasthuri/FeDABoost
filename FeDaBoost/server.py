@@ -553,46 +553,28 @@ class DittoServer(Server):
 
             self._broadcast(self.global_model)
 
-            # 3) Each selected client trains both:
-            #    - The 'global model' copy (standard local FL updates)
-            #    - Their personal model (Ditto approach)
-            #    and returns the updated global model parameters
             num_data_points = {}
             for client in train_clients.values():
-                # (a) Evaluate current global model (optional)
                 pre_loss, pre_f1 = client.evaluate()
                 
-                # (b) DittoClient.train(...) -> (updated_global_model, updated_personal_model)
-                updated_global, updated_personal = client.train(
+                client.train(
                     global_round=round_idx,
                     max_local_round=max_local_round,
                     threshold=threshold,
                     patience=patience
                 )
-
-                personal_ckpt_path = f"{self.checkpoint_path}/personal_ckpts/ckpt_{round_idx}/{client.client_id}.pt"
-                self.save_checkpt(updated_personal, personal_ckpt_path)
                 
-                # The updated global model is now in client.get_model() (or updated_global).
-                # The personal model is in client.get_personal_model().
-                
-                # (c) Count local datapoints for weighting in the aggregator
                 num_data_points[client.client_id] = client.get_num_datapoints()
-                
-                # (d) "Receive" - In your original code, you do this to update references
                 self._receive(client)
 
-            # 4) Aggregate the updated global models from all selected clients
             total_data_points = sum(num_data_points[cid] for cid in train_clients)
             weights = [num_data_points[cid] / total_data_points for cid in train_clients]
             self.global_model, update_status = self._aggregate(train_clients, weights=weights)
 
-            # 5) Save a checkpoint
             ckpt_path = f"{self.checkpoint_path}/checkpoints/ckpt_{round_idx}.pt"
             self.save_checkpt(self.global_model, ckpt_path)
             print(f"Model Updated: {update_status}")
 
-            # 6) Early stopping logic: If the global model was not updated, increment
             if not update_status:
                 consecutive_no_update_rounds += 1
                 print("The global model parameters have not been updated, so the training may be converging.")
@@ -605,30 +587,3 @@ class DittoServer(Server):
 
         return self.global_model
 
-    # If you want to evaluate personal models on the server side, you can define a helper:
-    def evaluate_personal_models(self, client_ids=None):
-        """
-        Evaluate the personal models on a subset (or all) of clients.
-        Typically, personal models stay local to each client in Ditto.
-
-        Parameters:
-        -----------
-        client_ids: list or None
-            If None, evaluate personal models for all connected clients.
-            Otherwise, only evaluate for clients in the provided list.
-
-        Returns:
-        --------
-        results: dict
-            Mapping from client_id -> (loss, f1) for the personal model.
-        """
-        if client_ids is None:
-            client_ids = list(self.client_dict.keys())
-
-        results = {}
-        for cid in client_ids:
-            client = self.client_dict[cid]
-            loss_avg, f1_avg = client.evaluate_personal_model()
-            results[cid] = (loss_avg, f1_avg)
-            print(f"Client {cid} [personal model] -> loss: {loss_avg:.4f}, f1: {f1_avg:.4f}")
-        return results

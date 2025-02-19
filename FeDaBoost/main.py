@@ -62,8 +62,8 @@ def setup_logging(stratergy,dataset, timestamp):
 
 def parse_arguments():
     parser = argparse.ArgumentParser(description="Federated training parameters")
-    parser.add_argument("--dataset", type=dataset_enum, default="mnist", help="Choose a dataset from the available options; femnist, mnist, kv")
-    parser.add_argument("--data_dir", type=str, default="datasets/mnist/", help="Path to the data directory, expected to have train and test directories with names trainpt and testpt respectively." )
+    parser.add_argument("--dataset", type=dataset_enum, default="femnist", help="Choose a dataset from the available options; femnist, mnist, kv")
+    parser.add_argument("--data_dir", type=str, default="datasets/femnist/", help="Path to the data directory, expected to have train and test directories with names trainpt and testpt respectively." )
     parser.add_argument("--loss_function", type=str, default="FocalLoss", help="Choose a loss function from the available options; CrossEntropyLoss, FocalLoss, HybridLoss")
     parser.add_argument("--stratergy", type=str, default="ditto", help="Choose a federated learning stratergy from the available options; fedavg, fedprox, fedaboost")
     parser.add_argument("--log_summary", action="store_true")
@@ -164,7 +164,10 @@ class Federation:
                         weight_decay=self.weight_decay,
                         local_model=self.model,
                         personal_learning_rate=self.learning_rate, 
-                        ditto_lambda=0.2            
+                        ditto_lambda=0.2,
+                        personalized=True,
+                        checkpt_path=checkpt_path,
+
                     )
                 )
         else:
@@ -278,7 +281,7 @@ if __name__ == "__main__":
         loss_fn = getattr(torch.nn, args.loss_function)()
     
     log_summary = args.log_summary
-    checkpt_path = f"checkpt/{stratergy}/{dataset.name}/test_withk/epoch_{epochs}/{global_rounds}_rounds_{local_rounds}_epochs_per_round/"
+    checkpt_path = f"checkpt/{stratergy}/{dataset.name}/epoch_{epochs}/{global_rounds}_rounds_{local_rounds}_epochs_per_round/"
     client_ids = get_client_ids(train_data_dir)
 
     if args.dataset == Dataset.FEMNIST:

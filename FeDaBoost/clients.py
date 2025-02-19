@@ -18,7 +18,7 @@ Paper: [FeDABoost: AdaBoost Enhanced Federated Learning]
 Published in: 
 
 """
-
+import os
 import torch
 import math
 import logging
@@ -461,7 +461,8 @@ class DittoClient(Client):
         local_model: object = None,           
         personal_learning_rate: float = 0.01,   # Personal model learning rate
         ditto_lambda: float = 0.1,
-        personalized: bool = False,                
+        personalized: bool = True,
+        checkpt_path: str = None,                
     ) -> None:
         
         super().__init__(
@@ -478,17 +479,16 @@ class DittoClient(Client):
         # Ditto-specific parameters
         self.ditto_lambda = ditto_lambda
         self.personalized = personalized
+        self.checkpt_path = checkpt_path
         self.personal_lr = personal_learning_rate if self.personalized else learning_rate
 
-
-        # Personal (private) model for Ditto
-        # Deep-copy the global/local model architecture
+        # Take Deep-copy the global/local model architecture as the personal model for Ditto
         self.personal_model = copy.deepcopy(self.local_model).to(self.device)
         
         # Personal optimizer (different LR is often used)
         self.personal_optimizer = torch.optim.SGD(
             self.personal_model.parameters(),
-            lr=personal_learning_rate,
+            lr=self.personal_lr,
             weight_decay=weight_decay,
         )
 
@@ -501,20 +501,20 @@ class DittoClient(Client):
     ):
         """
         Overrides the parent train method to:
-          1) Train the global (local_model) using the parent’s standard procedure.
-          2) Train the personal_model with an L2 penalty to keep it close to local_model.
+          1) Train the global model using fedAvg's standard procedure.
+          2) Train the personal_model with an L2 penalty to keep it close to global model.
         
         Returns:
-            (global_model, personal_model): The updated global model and personal model.
+            global_model: The updated global model and personal model.
         """
-        # ===== 1) Standard FL local training on local_model (global model copy) =====
+        # Standard FL local training on local_model (global model copy).
         super().train(global_round, max_local_round, threshold, patience)
-
-        # ===== 2) Ditto personal model training =====
+        # Personal model training.
         self._train_personal_model(global_round, max_local_round)
 
-        # Return both updated local_model (global model) and personal_model
-        return self.local_model, self.personal_model
+        personal_ckpt_path = f"{self.checkpt_path}/personal_ckpts/{self.client_id}/round_{global_round}.pt"
+        self._save_checkpt(self.personal_model, personal_ckpt_path)
+        return self.local_model
 
     def _train_personal_model(self, global_round: int, max_local_round: int):
         """
@@ -524,12 +524,17 @@ class DittoClient(Client):
         print(f"Client: {self.client_id} \tTraining personal model for Ditto...")
         logging.info(f"Client: {self.client_id} \tTraining personal model for Ditto...")
 
+        self.personal_model.train()
+
         for epoch in range(max_local_round):
             batch_losses = []
+            with torch.no_grad():
+                anchor_params = [p.detach() for p in self.local_model.parameters()]
+
             for x, y in self.traindl:
                 x, y = x.to(self.device), y.to(self.device)
-                
                 predictions = self.personal_model(x)
+
                 if isinstance(self.loss_fn, torch.nn.CrossEntropyLoss) and isinstance(self.train_dataset, FEMNISTDataset):
                     y = y.view(-1)
                 elif isinstance(self.train_dataset, MNISTDataset):
@@ -539,23 +544,13 @@ class DittoClient(Client):
 
                 loss = self.loss_fn(predictions, y)
 
-                # Ditto penalty: L2 distance between personal_model & local_model
+                # L2 distance between personal_model & local_model
                 ditto_penalty = 0.0
-                with torch.no_grad():
-                    # We will subtract local_model params, which are anchor (global round's updated copy).
-                    anchor_params = [p.detach() for p in self.local_model.parameters()]
-
-                # Add penalty for each parameter pair
                 for personal_param, anchor_param in zip(self.personal_model.parameters(), anchor_params):
                     ditto_penalty += torch.sum((personal_param - anchor_param) ** 2)
                 
-                # Scale penalty
                 ditto_penalty = self.ditto_lambda * 0.5 * ditto_penalty  # 0.5 is optional scaling
-
-                # Final loss
                 total_loss = loss + ditto_penalty
-
-                # Backprop
                 self.personal_optimizer.zero_grad()
                 total_loss.backward()
                 self.personal_optimizer.step()
@@ -566,50 +561,31 @@ class DittoClient(Client):
             print(f"Client: {self.client_id} \tEpoch (personal): {epoch+1} \tAvg Loss: {avg_loss:.6f} \tGlobal Round: {global_round}")
             logging.info(f"Client: {self.client_id} \tEpoch (personal): {epoch+1} \tAvg Loss: {avg_loss:.6f} \tGlobal Round: {global_round}")
 
-    def evaluate_personal_model(self) -> tuple:
+    def _save_checkpt(self, checkpoint: torch.nn.Module, ckptpath: str) -> None:
         """
-        Evaluate the personal_model with the validation dataset.
-        Returns (loss_avg, f1_score_avg).
+        Saving the checkpoints.
+
+        Parameters:
+        ----------------
+        checkpoint:
+            Model at a specific checkpoint.
+        ckptpath: str;
+            Path to save the checkpoint. Default is None.
+
+        Returns:
+        ----------------
+        None
         """
-        batch_loss = []
-        all_preds = []
-        all_labels = []
+        if os.path.exists(ckptpath):
+            torch.save(
+                checkpoint.state_dict(),
+                ckptpath,
+            )
+        else:
+            os.makedirs(os.path.dirname(ckptpath), exist_ok=True)
+            torch.save(
+                checkpoint.state_dict(),
+                ckptpath,
+            )
 
-        self.personal_model.eval()
-        with torch.no_grad():
-            for x, y in self.valdl:
-                x, y = x.to(self.device), y.to(self.device)
-                outputs = self.personal_model(x)
 
-                # Convert label format if needed
-                if isinstance(self.loss_fn, torch.nn.CrossEntropyLoss) and isinstance(self.train_dataset, FEMNISTDataset):
-                    y = y.view(-1)
-                elif isinstance(self.train_dataset, MNISTDataset):
-                    y = torch.argmax(y, dim=1)
-                else:
-                    y = y.view(-1, 1)
-
-                loss = self.loss_fn(outputs, y)
-                batch_loss.append(loss.item())
-
-                preds = torch.argmax(outputs, dim=1)
-                all_preds.extend(preds.cpu().numpy())
-                all_labels.extend(y.cpu().numpy())
-
-        loss_avg = sum(batch_loss) / len(batch_loss)
-        f1_avg = f1_score(all_labels, all_preds, average='macro')
-
-        self.personal_model.train()  # Switch back to train mode
-        return loss_avg, f1_avg
-
-    def set_personal_model(self, state_dict) -> None:
-        """
-        Overwrite the personalized model’s weights.
-        """
-        self.personal_model.load_state_dict(state_dict)
-
-    def get_personal_model(self) -> object:
-        """
-        Get the personal model for the client.
-        """
-        return self.personal_model
