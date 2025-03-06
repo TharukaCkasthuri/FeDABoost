@@ -39,7 +39,6 @@ from sklearn.metrics import f1_score
 from torch.utils.tensorboard import SummaryWriter
 
 class Server:
-
     """
     The federated learning server class. 
     
@@ -139,7 +138,7 @@ class Server:
         return sampled_clients
 
 
-    def _aggregate(self,trained_clients, weights = None) -> None:
+    def _aggregate(self, trained_clients, weights = None) -> None:
         """
         Aggregate the models of the clients.     
 
@@ -163,8 +162,6 @@ class Server:
         "fedavg": weighted_avg,
         "fedprox": fedProx,
         "fedaboost-optima": weighted_avg,
-        "fedaboost-ranker": weighted_avg,
-        "fedaboost-concord": weighted_avg,
         "ditto": weighted_avg,
         }
 
@@ -182,7 +179,7 @@ class Server:
         return self.global_model, updated
 
 
-    def _broadcast(self, model: torch.nn.Module) -> None:
+    def _broadcast(self, model: torch.nn.Module, clients:list = None) -> None:
         """
         Broadcast the model to the clients.
 
@@ -192,10 +189,15 @@ class Server:
             Model to be broadcasted
         """
         model_state_dict = model.state_dict()
+
+        if clients is None:
+            clients = list(self.client_dict.keys())
+
         for client_id, client in self.client_dict.items():
-            client.set_model(model_state_dict)
-            self.client_dict[client_id] = client
-            print(f"Broadcasted model to client {client.client_id}")
+            if client_id in clients:
+                client.set_model(model_state_dict)
+                self.client_dict[client_id] = client
+                print(f"Broadcasted model to client {client.client_id}")
 
 
     def _receive(self, client:callable) -> list:
@@ -237,18 +239,17 @@ class Server:
             train_clients_list= train_samples[str(round)]
             train_clients = {client: self.client_dict[client] for client in train_clients_list}
             logging.info(f"Selected Clients: {train_clients.keys()}")
-
-            self._broadcast(self.global_model)
+            self._broadcast(self.global_model, train_clients.keys())
 
             for client in train_clients.values():
-                #client.set_model(self.global_model.state_dict())
-                loss, f1 = client.evaluate()
                 _ = client.train(round,max_local_round,threshold, patience)
                 num_data_points[client.client_id] = client.get_num_datapoints()
                 self._receive(client)
 
             total_data_points = sum(num_data_points[client.client_id] for client in train_clients.values())
             weights = [num_data_points[client.client_id] / total_data_points for client in train_clients.values()]
+            
+            logging.info(f"Weights used for aggregation: {weights}")
             self.global_model, update_status = self._aggregate(train_clients, weights=weights)
             self.save_checkpt(self.global_model, f"{self.checkpoint_path}/checkpoints/ckpt_{round}.pt")
             print(f"Model Updated: {update_status}")
@@ -385,10 +386,10 @@ class Server:
                 ckptpath,
             )
 
-class OptimaServer(Server):
+class BoostingServer(Server):
 
     """
-    The federated learning server class for fedaboost-optima.
+    The federated learning server class for fedaboost.
 
     Parameters:
     ----------------
@@ -410,7 +411,7 @@ class OptimaServer(Server):
         super().__init__(rounds, strategy, checkpt_path, log_dir)
         self.max_local_round = max_local_round
         self.scaler = MinMaxScaler(feature_range=(0, 1))
-        logging.info("FedaBoost-Optima Boosting Server Initialized")
+        logging.info("Boosting Server Initialized")
 
 
     def __aggregate(self,trained_clients, weights = None) -> None:
@@ -474,24 +475,22 @@ class OptimaServer(Server):
 
             for client in train_clients.values():
                 client.set_model(self.global_model.state_dict())
+                _, alpha = client.train(round, max_local_round,k,threshold, patience)
 
-                _ = client.train(round, max_local_round,k, threshold, patience,)
-                _, alpha = client.get_alpha(k)
                 alphas[client.client_id] = alpha
                 #logging.info(f"Client {client.client_id} Alpha: {alpha}")
                 self._receive(client)
 
 
-            logging.info(f"Alphas: {alphas}")
-            final_alphas = influence_alpha(0.5, alphas, alpha_constant)
-            logging.info(f"Final Alphas: {final_alphas}")
+            logging.info(f"Alpha values used for aggregation: {alphas}")
+
             alpha_values = self.scaler.fit_transform(np.array(list(alphas.values())).reshape(-1, 1))
-            self.global_model, update_status = self.__aggregate(train_clients, alpha_values.flatten())
+            self.global_model, update_status = self.__aggregate(train_clients, np.array(list(alphas.values())))
 
             self.save_checkpt(self.global_model, f"{self.checkpoint_path}/checkpoints/ckpt_{round}.pt")
 
             print(f"Model Updated: {update_status}")
-            logging.info(f"Model Updated Successfully using Fedaboost-Optima: {update_status}")
+            logging.info(f"Model Updated Successfully using Fedaboost weighted averaging: {update_status}")
 
             self._broadcast(self.global_model)
             
@@ -553,46 +552,28 @@ class DittoServer(Server):
 
             self._broadcast(self.global_model)
 
-            # 3) Each selected client trains both:
-            #    - The 'global model' copy (standard local FL updates)
-            #    - Their personal model (Ditto approach)
-            #    and returns the updated global model parameters
             num_data_points = {}
             for client in train_clients.values():
-                # (a) Evaluate current global model (optional)
                 pre_loss, pre_f1 = client.evaluate()
                 
-                # (b) DittoClient.train(...) -> (updated_global_model, updated_personal_model)
-                updated_global, updated_personal = client.train(
+                client.train(
                     global_round=round_idx,
                     max_local_round=max_local_round,
                     threshold=threshold,
                     patience=patience
                 )
-
-                personal_ckpt_path = f"{self.checkpoint_path}/personal_ckpts/ckpt_{round_idx}/{client.client_id}.pt"
-                self.save_checkpt(updated_personal, personal_ckpt_path)
                 
-                # The updated global model is now in client.get_model() (or updated_global).
-                # The personal model is in client.get_personal_model().
-                
-                # (c) Count local datapoints for weighting in the aggregator
                 num_data_points[client.client_id] = client.get_num_datapoints()
-                
-                # (d) "Receive" - In your original code, you do this to update references
                 self._receive(client)
 
-            # 4) Aggregate the updated global models from all selected clients
             total_data_points = sum(num_data_points[cid] for cid in train_clients)
             weights = [num_data_points[cid] / total_data_points for cid in train_clients]
             self.global_model, update_status = self._aggregate(train_clients, weights=weights)
 
-            # 5) Save a checkpoint
             ckpt_path = f"{self.checkpoint_path}/checkpoints/ckpt_{round_idx}.pt"
             self.save_checkpt(self.global_model, ckpt_path)
             print(f"Model Updated: {update_status}")
 
-            # 6) Early stopping logic: If the global model was not updated, increment
             if not update_status:
                 consecutive_no_update_rounds += 1
                 print("The global model parameters have not been updated, so the training may be converging.")
@@ -605,30 +586,3 @@ class DittoServer(Server):
 
         return self.global_model
 
-    # If you want to evaluate personal models on the server side, you can define a helper:
-    def evaluate_personal_models(self, client_ids=None):
-        """
-        Evaluate the personal models on a subset (or all) of clients.
-        Typically, personal models stay local to each client in Ditto.
-
-        Parameters:
-        -----------
-        client_ids: list or None
-            If None, evaluate personal models for all connected clients.
-            Otherwise, only evaluate for clients in the provided list.
-
-        Returns:
-        --------
-        results: dict
-            Mapping from client_id -> (loss, f1) for the personal model.
-        """
-        if client_ids is None:
-            client_ids = list(self.client_dict.keys())
-
-        results = {}
-        for cid in client_ids:
-            client = self.client_dict[cid]
-            loss_avg, f1_avg = client.evaluate_personal_model()
-            results[cid] = (loss_avg, f1_avg)
-            print(f"Client {cid} [personal model] -> loss: {loss_avg:.4f}, f1: {f1_avg:.4f}")
-        return results

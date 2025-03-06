@@ -16,9 +16,9 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 Paper: [FeDABoost: AdaBoost Enhanced Federated Learning]
 Published in: 
-
 """
-
+import os
+import copy
 import torch
 import math
 import logging
@@ -29,6 +29,8 @@ from torch.utils.data import DataLoader
 from utils import get_device
 from datasets.mnist.preprocess import MNISTDataset
 from datasets.femnist.preprocess import FEMNISTDataset
+from datasets.celeba.preprocess import CELEBADataset
+from datasets.cifar10.preprocess import CIFARDataset
 from sklearn.metrics import f1_score
 
 class Client:
@@ -37,14 +39,14 @@ class Client:
 
     Parameters:
     ------------
-    client_id: str; client id
-    train_dataset: torch.utils.data.Dataset object; training dataset
-    test_dataset: torch.utils.data.Dataset object; validation dataset
-    loss_fn: torch.nn.Module object; loss function
-    batch_size: int; batch size
-    learning_rate: float; learning rate
-    weight_decay: float; weight decay
-    local_model: torch.nn.Module object; model
+    client_id: str; client id.
+    train_dataset: torch.utils.data.Dataset object; training dataset.
+    test_dataset: torch.utils.data.Dataset object; validation dataset.
+    loss_fn: torch.nn.Module object; loss function.
+    batch_size: int; batch size.
+    learning_rate: float; learning rate.
+    weight_decay: float; weight decay.
+    local_model: torch.nn.Module object; model.
     """
 
     def __init__(
@@ -53,7 +55,8 @@ class Client:
         train_dataset: object,
         test_dataset: object,
         loss_fn: torch.nn.Module,
-        batch_size: int,
+        train_batch_size: int,
+        test_batch_size: int,
         learning_rate: float,
         weight_decay: float,
         local_model: object = None,
@@ -61,13 +64,13 @@ class Client:
 
         self.client_id: str = client_id
         self.loss_fn = loss_fn
-        self.batch_size = batch_size
+        self.batch_size = train_batch_size
 
         self.traindl = DataLoader(
-            train_dataset, batch_size, shuffle=True, drop_last=True
+            train_dataset, train_batch_size, shuffle=True, drop_last=True
         )
 
-        self.valdl = DataLoader(test_dataset, 8, shuffle=False, drop_last=True)
+        self.valdl = DataLoader(test_dataset, test_batch_size, shuffle=False, drop_last=True)
         self.optimizer = torch.optim.SGD(
             local_model.parameters(),
             lr=learning_rate,
@@ -93,7 +96,22 @@ class Client:
         ------------
         model_weights: dict; state dictionary of model weights
         """
-        self.local_model.load_state_dict(model_weights)
+        print(f"Client: {self.client_id} \tReceiving global model...")
+        logging.info(f"Client: {self.client_id} \tReceiving global model...")
+        
+        prev_weights = copy.deepcopy(self.local_model.state_dict())
+        
+        try:
+            update_status = self.local_model.load_state_dict(model_weights, strict=True)
+            
+            if update_status.missing_keys or update_status.unexpected_keys:
+                logging.warning(f"Client: {self.client_id} encountered update issues: missing_keys={update_status.missing_keys}, unexpected_keys={update_status.unexpected_keys}. Reverting to previous weights.")
+                self.local_model.load_state_dict(prev_weights)
+            else:
+                logging.info(f"Client: {self.client_id} model updated successfully.")
+        except Exception as e:
+            logging.error(f"Client: {self.client_id} error during model update: {e}. Reverting to previous weights.")
+            self.local_model.load_state_dict(prev_weights)
 
     def get_model(self) -> object:
         """
@@ -128,25 +146,28 @@ class Client:
         print(f"Client: {self.client_id} \tTraining...")
         logging.info(f"Client: {self.client_id} \tTraining...")
 
+        val_loss, val_f1 = self.evaluate()
+        print(f"Client: {self.client_id} \tInitial Validation Loss: {val_loss} \tInitial Validation F1: {val_f1}")
+        logging.info(f"Client: {self.client_id} \tInitial Validation Loss before training: {val_loss} \tInitial Validation F1: {val_f1}")
+
         for epoch in range(max_local_round):
-            print("\n")
             batch_loss = []
             for batch_idx, (x, y) in enumerate(self.traindl):
                 x, y = x.to(self.device), y.to(self.device)
                 outputs = self.local_model(x)
-
                 if isinstance(self.loss_fn, torch.nn.CrossEntropyLoss) and isinstance(self.train_dataset, FEMNISTDataset):
                     y = y.view(-1)
                 elif isinstance(self.train_dataset, MNISTDataset):
                     y = torch.argmax(y, dim=1)
+                elif isinstance(self.train_dataset, CIFARDataset):
+                    y = torch.argmax(y, dim=1)
                 else:
                     y = y.view(-1, 1)
-
                 loss = self.loss_fn(outputs, y)
                 self.local_model.zero_grad()
                 loss.backward()
                 self.optimizer.step()
-    
+
                 batch_loss.append(loss.item())
     
             loss_avg = sum(batch_loss) / len(batch_loss)    
@@ -154,6 +175,7 @@ class Client:
             logging.info(f"Client: {self.client_id} \tEpoch: {epoch + 1} \tAverage Training Loss: {loss_avg} \tGlobal Round: {global_round}")
 
             # Dynamic loss reduction evaluation.
+            """
             loss_reduction = previous_loss_avg - loss_avg
             if loss_reduction < threshold:
                 no_improvement_rounds += 1
@@ -168,6 +190,11 @@ class Client:
                 break
 
             previous_loss_avg = loss_avg
+            """
+
+        val_loss, val_f1 = self.evaluate()
+        print(f"Client: {self.client_id} \t Updated Validation Loss: {val_loss} \tUpdated Validation F1: {val_f1}")
+        logging.info(f"Client: {self.client_id} \tUpdated Loss: {val_loss} \tUpdated Validation F1: {val_f1}")
 
         return self.local_model
 
@@ -196,6 +223,8 @@ class Client:
                 y = y.view(-1)
             elif isinstance(self.train_dataset, MNISTDataset):
                 y = torch.argmax(y, dim=1)
+            elif isinstance(self.train_dataset, CIFARDataset):
+                    y = torch.argmax(y, dim=1)
             else:
                 y = y.view(-1, 1)
             
@@ -221,7 +250,7 @@ class BoostingClient(Client):
     train_dataset: torch.utils.data.Dataset object; training dataset
     test_dataset: torch.utils.data.Dataset object; validation dataset
     loss_fn: torch.nn.Module object; loss function
-    batch_size: int; batch size
+    train_batch_size: int; batch size
     learning_rate: float; learning rate
     weight_decay: float; weight decay
     local_model: torch.nn.Module object; model
@@ -234,7 +263,8 @@ class BoostingClient(Client):
         train_dataset: object,
         test_dataset: object,
         loss_fn: torch.nn.Module,
-        batch_size: int,
+        train_batch_size: int,
+        test_batch_size: int,
         learning_rate: float,
         weight_decay: float,
         local_model: object = None,
@@ -246,18 +276,19 @@ class BoostingClient(Client):
             train_dataset, 
             test_dataset, 
             loss_fn, 
-            batch_size, 
+            train_batch_size,
+            test_batch_size, 
             learning_rate, 
             weight_decay, 
             local_model
         )
 
+        self.loss_fn = copy.deepcopy(loss_fn)
         self.eta = 0.1
         self.error_threshold = 0.3
-        self.num_classes = num_classes
         self.loss_fn.gamma = 0
 
-    def train(self, global_round, max_local_round,k, threshold=0.01, patience=2,) -> tuple:
+    def train(self, global_round, max_local_round, k, threshold=0.01, patience=2,) -> tuple:
         """
         Training the model, using the fedaboost-optima strategy.
 
@@ -270,21 +301,30 @@ class BoostingClient(Client):
         ------------
         model: torch.nn.Module object; trained model.
         """
-
         error_rate, alpha = self.get_alpha(k)
-        self.weight = self.update_weight(alpha, performance_indicator = (error_rate > self.error_threshold))
+        logging.info(f"Client {self.client_id} error rate Before start training: {error_rate}")
+        print(f"Client {self.client_id} alpha for boosting weights: {alpha}")
+        logging.info(f"Client {self.client_id} alpha for boosting weights: {alpha}")
+        logging.info(f'Clients weights before update: {self.weight}')
+        prev_weight = self.weight
+        self.weight = self.update_weight(alpha, error_rate, performance_indicator = (error_rate > self.error_threshold))
+        logging.info(f'Clients weights after update: {self.weight}')
+        logging.info(f'Clients weights change: {self.weight - prev_weight}')
+        
+        
+        if (error_rate > self.error_threshold):
+            print(f"The client training is boosted by: {self.weight}")
+            logging.info(f"The client training is boosted by weight: {self.weight}")
+            max_gamma = 4
+            target_gamma_increase = max_gamma/100  # e.g., 0.04 as the target increment at baseline weight
 
-        print(f"The client training is boosted by: {self.weight}")
-        logging.info(f"The client training is boosted by: {self.weight}")
-
-        if global_round == 1:
-            pass
+            gamma_increment = target_gamma_increase * (self.weight / self.initial_weight)
+            new_gamma = min(self.loss_fn.gamma + gamma_increment, max_gamma)
+            self.loss_fn.update_gamma(new_gamma)
+            logging.info(f"Client {self.client_id} gamma for training: {self.loss_fn.gamma}")
         else:
-            if (error_rate > self.error_threshold):
-                new_gamma = min((self.weight + self.loss_fn.gamma), 3)
-                #self.loss_fn.update_gamma(new_gamma)
-
-        logging.info(f"Client focal loss gamma: {self.loss_fn.gamma}")
+            logging.info(f"The client training is not boosted by weight: {self.weight}, because the error rate is less than the threshold.")
+            logging.info(f"Client {self.client_id} gamma for training: {self.loss_fn.gamma}")
 
         previous_loss_avg = float('inf')  
         no_improvement_rounds = 0  
@@ -292,10 +332,11 @@ class BoostingClient(Client):
         print(f"Client: {self.client_id} \tTraining...")
         logging.info(f"Client: {self.client_id} \tTraining...")
 
-        
+        val_loss, val_f1 = self.evaluate()
+        print(f"Client: {self.client_id} \tInitial Validation Loss: {val_loss} \tInitial Validation F1: {val_f1}")
+        logging.info(f"Client: {self.client_id} \tInitial Validation Loss before training: {val_loss} \tInitial Validation F1: {val_f1}")
 
         for epoch in range(max_local_round):
-            print("\n")
             batch_loss = []
             for batch_idx, (x, y) in enumerate(self.traindl):
                 x, y = x.to(self.device), y.to(self.device)
@@ -305,6 +346,8 @@ class BoostingClient(Client):
                     y = y.view(-1)
                 elif isinstance(self.train_dataset, MNISTDataset):
                     y = torch.argmax(y, dim=1)
+                elif isinstance(self.train_dataset, CIFARDataset):
+                    y = torch.argmax(y, dim=1)
                 else:
                     y = y.view(-1, 1)
 
@@ -312,13 +355,13 @@ class BoostingClient(Client):
                 self.local_model.zero_grad()
                 loss.backward()
                 self.optimizer.step()
-    
                 batch_loss.append(loss.item())
     
             loss_avg = sum(batch_loss) / len(batch_loss)    
-            print(f"Client: {self.client_id} \tEpoch: {epoch + 1} \tAverage Training Loss: {loss_avg} \tGlobal Round: {global_round} {self.loss_fn.gamma} {alpha}")
-            logging.info(f"Client: {self.client_id} \tEpoch: {epoch + 1} \tAverage Training Loss: {loss_avg} \tGlobal Round: {global_round} {self.loss_fn.gamma} {alpha}")
+            print(f"Client: {self.client_id} \tEpoch: {epoch + 1} \tAverage Training Loss: {loss_avg} \tGlobal Round: {global_round} \tGamma: {self.loss_fn.gamma}")
+            logging.info(f"Client: {self.client_id} \tEpoch: {epoch + 1} \tAverage Training Loss: {loss_avg} \tGlobal Round: {global_round} \tGamma: {self.loss_fn.gamma}")
 
+            """
             # Dynamic loss reduction evaluation.
             loss_reduction = previous_loss_avg - loss_avg
 
@@ -334,9 +377,15 @@ class BoostingClient(Client):
                 logging.info(f"Stopping early at local epoch {epoch + 1} due to no significant improvement.")
                 break
 
-            previous_loss_avg = loss_avg            
+            previous_loss_avg = loss_avg
+            """            
+        error_rate, alpha = self.get_alpha(k)
+        logging.info(f"Client {self.client_id} error rate After training: {error_rate}")
+        val_loss, val_f1 = self.evaluate()
+        print(f"Client: {self.client_id} \t Updated Validation Loss: {val_loss} \tUpdated Validation F1: {val_f1}")
+        logging.info(f"Client: {self.client_id} \tUpdated Loss: {val_loss} \tUpdated Validation F1: {val_f1}")
 
-        return self.local_model
+        return self.local_model, alpha
 
     def __get_error_rate(self) -> float:
         """
@@ -349,13 +398,15 @@ class BoostingClient(Client):
         incorrect_preds = 0
         total_samples = 0
 
-        for _, (x, y) in enumerate(self.traindl):
+        for _, (x, y) in enumerate(self.valdl):
             x, y = x.to(self.device), y.to(self.device)
             outputs = self.local_model(x)
 
             if isinstance(self.train_dataset, FEMNISTDataset):
                 y = y.view(-1)
             elif isinstance(self.train_dataset, MNISTDataset):
+                y = torch.argmax(y, dim=1)
+            elif isinstance(self.train_dataset, CIFARDataset):
                 y = torch.argmax(y, dim=1)
             else:
                 y = y.view(-1, 1)
@@ -369,29 +420,20 @@ class BoostingClient(Client):
         error_rate = incorrect_preds / total_samples if total_samples > 0 else 0
         return error_rate
     
-    def get_alpha(self,k):
+    def get_alpha(self, k, alpha_max=12) -> float:
         """
-        Calculate adjusted weights for client in the FL setting, 
+        Calculate adjusted weight (alpha) for the client in the FL setting,
         giving higher weights to clients with lower errors with the global model.
-
-        Parameters:
-        - error: Error value for the client validation data with the global model.
-
-        Returns:
-        - Adjusted weight (alpha) for the client.
         """
         error_rate = self.__get_error_rate()
-        logging.info(f"Client {self.client_id} Error rate: {error_rate}")
-
-        if 0 < error_rate < 1:
-            alpha = np.log((1 - error_rate) / (error_rate)) + np.log(k - 1)
-        elif error_rate == 1:
-            alpha = np.log((1 - (1-1e-6)) / (1-1e-6)) + np.log(k - 1)
-        elif error_rate == 0:
-            alpha = np.log((1 - 1e-6) / (1e-6)) + np.log(k - 1)
-        else:
-            raise ValueError("Error value must be in the range [0, 1].")
-
+        eps = 1e-6
+        error_rate = min(max(error_rate, eps), 1 - eps)
+        alpha = np.log((1 - error_rate) / error_rate) + np.log(k - 1)
+        
+        # Scale alpha to be within [-alpha_max, alpha_max]
+        #alpha = alpha_max * (2 / (1 + np.exp(-alpha / alpha_max)) - 1)
+        #alpha = alpha_max * np.tanh(alpha / alpha_max)
+        
         return error_rate, alpha
     
     def set_weight(self, weight:float) -> None:
@@ -403,9 +445,10 @@ class BoostingClient(Client):
         weight: float; weight
         """
         self.weight = weight
+        self.initial_weight = weight
         return self.weight
 
-    def update_weight(self, alpha, performance_indicator=1) -> None:
+    def update_weight(self, alpha, error_rate, performance_indicator=1) -> None:
         """
         Update the weights for the client.
 
@@ -413,10 +456,17 @@ class BoostingClient(Client):
         ------------
         weight: float; weight
         """
-        self.weight = self.weight * math.exp(float(self.eta) * -float(alpha) * int(performance_indicator))
+
+        if alpha < 0:  
+            scale = 1 + (1 - error_rate)  # Higher error → stronger boost
+            self.weight *= math.exp(-self.eta * alpha * scale)  
+        elif error_rate > 0.5:
+            # Boost moderately bad clients, but less aggressively
+            scale = 0.5 + (1 - error_rate)  # Smooth increase
+            self.weight *= math.exp(self.eta * alpha * scale)
+        else:
+            self.weight = self.weight * math.exp(float(self.eta) *  -float(alpha) * int(performance_indicator))
         return self.weight
-
-
 
 class DittoClient(Client):
     """
@@ -434,7 +484,7 @@ class DittoClient(Client):
         The test/validation dataset for this client.
     loss_fn: torch.nn.Module
         The loss function to use (e.g., CrossEntropyLoss).
-    batch_size: int
+    train_batch_size: int
         Batch size for local training.
     learning_rate: float
         Learning rate for local training of the global model.
@@ -455,13 +505,15 @@ class DittoClient(Client):
         train_dataset: object,
         test_dataset: object,
         loss_fn: torch.nn.Module,
-        batch_size: int,
+        train_batch_size: int,
+        test_batch_size: int,
         learning_rate: float,                   # Global model learning rate
         weight_decay: float,
         local_model: object = None,           
         personal_learning_rate: float = 0.01,   # Personal model learning rate
         ditto_lambda: float = 0.1,
-        personalized: bool = False,                
+        personalized: bool = True,
+        checkpt_path: str = None,                
     ) -> None:
         
         super().__init__(
@@ -469,7 +521,8 @@ class DittoClient(Client):
             train_dataset,
             test_dataset,
             loss_fn,
-            batch_size,
+            train_batch_size,
+            test_batch_size,
             learning_rate,
             weight_decay,
             local_model,
@@ -478,19 +531,32 @@ class DittoClient(Client):
         # Ditto-specific parameters
         self.ditto_lambda = ditto_lambda
         self.personalized = personalized
+        self.checkpt_path = checkpt_path
         self.personal_lr = personal_learning_rate if self.personalized else learning_rate
 
-
-        # Personal (private) model for Ditto
-        # Deep-copy the global/local model architecture
+        # Take Deep-copy the global/local model architecture as the personal model for Ditto
         self.personal_model = copy.deepcopy(self.local_model).to(self.device)
         
         # Personal optimizer (different LR is often used)
-        self.personal_optimizer = torch.optim.SGD(
+        conv_params = []
+        fc_params = []
+
+        for name, param in self.personal_model.named_parameters():
+            if "conv" in name:
+                conv_params.append(param)
+            else:
+                fc_params.append(param)
+
+        self.personal_optimizer = torch.optim.SGD([
+            {"params": conv_params, "lr": self.personal_lr * 2}, 
+            {"params": fc_params, "lr": self.personal_lr}  
+        ], weight_decay=0.0001, momentum=0.0)
+
+        self.personal_optimizer = torch.optim.Adam(
             self.personal_model.parameters(),
-            lr=personal_learning_rate,
-            weight_decay=weight_decay,
-        )
+            lr=self.personal_lr, 
+            weight_decay=0.0001)
+
 
     def train(
         self,
@@ -501,20 +567,22 @@ class DittoClient(Client):
     ):
         """
         Overrides the parent train method to:
-          1) Train the global (local_model) using the parent’s standard procedure.
-          2) Train the personal_model with an L2 penalty to keep it close to local_model.
+          1) Train the global model using fedAvg's standard procedure.
+          2) Train the personal_model with an L2 penalty to keep it close to global model.
         
         Returns:
-            (global_model, personal_model): The updated global model and personal model.
+            global_model: The updated global model and personal model.
         """
-        # ===== 1) Standard FL local training on local_model (global model copy) =====
+        # Standard FL local training on local_model (global model copy).
         super().train(global_round, max_local_round, threshold, patience)
 
-        # ===== 2) Ditto personal model training =====
+        # Personal model training.
         self._train_personal_model(global_round, max_local_round)
 
-        # Return both updated local_model (global model) and personal_model
-        return self.local_model, self.personal_model
+        personal_ckpt_path = f"{self.checkpt_path}/personal_ckpts/{self.client_id}/round_{global_round}.pt"
+    
+        self._save_checkpt(self.personal_model.eval(), personal_ckpt_path)
+        return self.local_model
 
     def _train_personal_model(self, global_round: int, max_local_round: int):
         """
@@ -524,12 +592,17 @@ class DittoClient(Client):
         print(f"Client: {self.client_id} \tTraining personal model for Ditto...")
         logging.info(f"Client: {self.client_id} \tTraining personal model for Ditto...")
 
-        for epoch in range(max_local_round):
+        self.personal_model.train()
+
+        for epoch in range(max_local_round*1):
             batch_losses = []
+
+            anchor_params = [p.detach() for p in self.local_model.parameters()]
+
             for x, y in self.traindl:
                 x, y = x.to(self.device), y.to(self.device)
-                
                 predictions = self.personal_model(x)
+
                 if isinstance(self.loss_fn, torch.nn.CrossEntropyLoss) and isinstance(self.train_dataset, FEMNISTDataset):
                     y = y.view(-1)
                 elif isinstance(self.train_dataset, MNISTDataset):
@@ -539,25 +612,21 @@ class DittoClient(Client):
 
                 loss = self.loss_fn(predictions, y)
 
-                # Ditto penalty: L2 distance between personal_model & local_model
+                # L2 distance between personal_model & local_model
                 ditto_penalty = 0.0
-                with torch.no_grad():
-                    # We will subtract local_model params, which are anchor (global round's updated copy).
-                    anchor_params = [p.detach() for p in self.local_model.parameters()]
-
-                # Add penalty for each parameter pair
                 for personal_param, anchor_param in zip(self.personal_model.parameters(), anchor_params):
-                    ditto_penalty += torch.sum((personal_param - anchor_param) ** 2)
-                
-                # Scale penalty
+                    ditto_penalty += torch.nn.functional.mse_loss(personal_param, anchor_param, reduction="sum")
+
                 ditto_penalty = self.ditto_lambda * 0.5 * ditto_penalty  # 0.5 is optional scaling
-
-                # Final loss
                 total_loss = loss + ditto_penalty
-
-                # Backprop
                 self.personal_optimizer.zero_grad()
                 total_loss.backward()
+
+                #for name, param in self.personal_model.named_parameters():
+                #    if param.grad is not None:
+                #        pass
+                        #print(f"{name} grad norm: {param.grad.norm().item()}")
+
                 self.personal_optimizer.step()
 
                 batch_losses.append(total_loss.item())
@@ -566,50 +635,31 @@ class DittoClient(Client):
             print(f"Client: {self.client_id} \tEpoch (personal): {epoch+1} \tAvg Loss: {avg_loss:.6f} \tGlobal Round: {global_round}")
             logging.info(f"Client: {self.client_id} \tEpoch (personal): {epoch+1} \tAvg Loss: {avg_loss:.6f} \tGlobal Round: {global_round}")
 
-    def evaluate_personal_model(self) -> tuple:
+    def _save_checkpt(self, checkpoint: torch.nn.Module, ckptpath: str) -> None:
         """
-        Evaluate the personal_model with the validation dataset.
-        Returns (loss_avg, f1_score_avg).
+        Saving the checkpoints.
+
+        Parameters:
+        ----------------
+        checkpoint:
+            Model at a specific checkpoint.
+        ckptpath: str;
+            Path to save the checkpoint. Default is None.
+
+        Returns:
+        ----------------
+        None
         """
-        batch_loss = []
-        all_preds = []
-        all_labels = []
+        if os.path.exists(ckptpath):
+            torch.save(
+                checkpoint.state_dict(),
+                ckptpath,
+            )
+        else:
+            os.makedirs(os.path.dirname(ckptpath), exist_ok=True)
+            torch.save(
+                checkpoint.state_dict(),
+                ckptpath,
+            )
 
-        self.personal_model.eval()
-        with torch.no_grad():
-            for x, y in self.valdl:
-                x, y = x.to(self.device), y.to(self.device)
-                outputs = self.personal_model(x)
 
-                # Convert label format if needed
-                if isinstance(self.loss_fn, torch.nn.CrossEntropyLoss) and isinstance(self.train_dataset, FEMNISTDataset):
-                    y = y.view(-1)
-                elif isinstance(self.train_dataset, MNISTDataset):
-                    y = torch.argmax(y, dim=1)
-                else:
-                    y = y.view(-1, 1)
-
-                loss = self.loss_fn(outputs, y)
-                batch_loss.append(loss.item())
-
-                preds = torch.argmax(outputs, dim=1)
-                all_preds.extend(preds.cpu().numpy())
-                all_labels.extend(y.cpu().numpy())
-
-        loss_avg = sum(batch_loss) / len(batch_loss)
-        f1_avg = f1_score(all_labels, all_preds, average='macro')
-
-        self.personal_model.train()  # Switch back to train mode
-        return loss_avg, f1_avg
-
-    def set_personal_model(self, state_dict) -> None:
-        """
-        Overwrite the personalized model’s weights.
-        """
-        self.personal_model.load_state_dict(state_dict)
-
-    def get_personal_model(self) -> object:
-        """
-        Get the personal model for the client.
-        """
-        return self.personal_model

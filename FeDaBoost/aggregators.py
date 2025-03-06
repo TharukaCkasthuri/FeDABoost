@@ -87,10 +87,10 @@ def fedProx(global_model: torch.nn.Module, local_models: List[torch.nn.Module], 
     
     return global_model
 
-def weighted_avg(global_model: torch.nn.Module, local_models: List[torch.nn.Module], weights: List[float])-> torch.nn.Module:
+def weighted_avg(global_model: torch.nn.Module, local_models: List[torch.nn.Module], weights: List[float]) -> torch.nn.Module:
     """
-    Average model parameters using weighted averaging.
-        
+    Average model parameters using weighted averaging, ignoring clients with negative weights.
+    
     Parameters:
     ------------
     global_model: torch.nn.Module object
@@ -106,18 +106,26 @@ def weighted_avg(global_model: torch.nn.Module, local_models: List[torch.nn.Modu
         Updated global model.
     """
     
-    state_dicts = [model.state_dict() for model in local_models]
-    normalized_weights = [weight / sum(weights) for weight in weights]
+    # Filter out clients with negative weights
+    valid_indices = [i for i, w in enumerate(weights) if w > 0]
+    if not valid_indices:
+        raise ValueError("No clients with positive weights available for aggregation.")
+    
+    valid_models = [local_models[i] for i in valid_indices]
+    valid_weights = [weights[i] for i in valid_indices]
+    
+    state_dicts = [model.state_dict() for model in valid_models]
+    normalized_weights = [w / sum(valid_weights) for w in valid_weights]
 
     with torch.no_grad():  
         for key in global_model.state_dict().keys():
             stacked_params = torch.stack(
-                [state_dict[key] * normalized_weights[i] for i, (state_dict) in enumerate(state_dicts)], dim=0
+                [state_dict[key] * normalized_weights[i] for i, state_dict in enumerate(state_dicts)], dim=0
             )
-
             global_model.state_dict()[key].copy_(stacked_params.sum(dim=0))  
 
     return global_model
+
 
 
 
