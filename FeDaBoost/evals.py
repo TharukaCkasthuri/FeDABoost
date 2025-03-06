@@ -29,6 +29,8 @@ from sklearn.metrics import accuracy_score, f1_score
 
 from datasets.femnist.preprocess import FEMNISTDataset
 from datasets.mnist.preprocess import MNISTDataset
+from datasets.celeba.preprocess import CELEBADataset
+from datasets.cifar10.preprocess import CIFARDataset
 
 def evaluate(
     model: torch.nn.Module,
@@ -66,6 +68,8 @@ def evaluate(
         if isinstance(loss_fn, torch.nn.CrossEntropyLoss) and isinstance(test_data, FEMNISTDataset):
             y = y.view(-1)
         elif isinstance(test_data, MNISTDataset):
+            y = torch.argmax(y, dim=1)
+        elif isinstance(test_data, CIFARDataset):
             y = torch.argmax(y, dim=1)
         else:
             y = y.view(-1, 1)
@@ -111,6 +115,8 @@ def evaluate_classification(
         if isinstance(loss_fn, torch.nn.CrossEntropyLoss) and isinstance(test_data, FEMNISTDataset):
             y = y.view(-1)
         elif isinstance(test_data, MNISTDataset):
+            y = torch.argmax(y, dim=1)
+        elif isinstance(test_data, CIFARDataset):
             y = torch.argmax(y, dim=1)
         else:
             y = y.view(-1, 1)
@@ -255,6 +261,41 @@ class FocalLoss(torch.nn.Module):
     def update_gamma(self, new_gamma):
         self.gamma = new_gamma
 
+
+class BinaryFocalLoss(nn.Module):
+    def __init__(self, alpha=1.0, gamma=2.0, reduction='mean'):
+        """
+        Binary Focal Loss.
+
+        Parameters:
+            alpha (float): Balancing factor.
+            gamma (float): Focusing parameter.
+            reduction (str): 'mean', 'sum', or 'none'.
+        """
+        super(BinaryFocalLoss, self).__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.reduction = reduction
+
+    def forward(self, inputs, targets):
+        """
+        Args:
+            inputs (Tensor): Predicted logits with shape (N, 1).
+            targets (Tensor): Ground truth labels with shape (N, 1) where each value is 0.0 or 1.0.
+        """
+        bce_loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction='none')
+        probs = torch.sigmoid(inputs)
+        pt = torch.where(targets == 1, probs, 1 - probs)
+        focal_factor = (1 - pt) ** self.gamma
+        
+        loss = self.alpha * focal_factor * bce_loss
+        
+        if self.reduction == 'mean':
+            return loss.mean()
+        elif self.reduction == 'sum':
+            return loss.sum()
+        else:
+            return loss
         
 
 class HybridLoss(nn.Module):

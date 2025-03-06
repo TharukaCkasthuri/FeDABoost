@@ -25,22 +25,25 @@ import argparse
 import configparser
 from datetime import datetime
 from enum import Enum
-
 import torch
 
 from clients import Client, BoostingClient, DittoClient
-from server import Server, OptimaServer, DittoServer
+from server import Server, BoostingServer, DittoServer
 from utils import get_device, get_client_ids
 
 from models.kv import ShallowNN
 from models.femnist import FEMNISTNet
 from models.mnist import MNISTNet
+from models.celeba import CELEBANet
+from models.cifar10 import CIFAR10Net
 
 from evals import FocalLoss, HybridLoss
 
 from datasets.kv.preprocess import KVDataSet
 from datasets.femnist.preprocess import FEMNISTDataset
 from datasets.mnist.preprocess import MNISTDataset
+from datasets.celeba.preprocess import CELEBADataset
+from datasets.cifar10.preprocess import CIFARDataset
 
 def load_config(config_path="config.cfg"):
     config = configparser.ConfigParser()
@@ -65,9 +68,9 @@ def parse_arguments():
     parser.add_argument("--dataset", type=dataset_enum, default="femnist", help="Choose a dataset from the available options; femnist, mnist, kv")
     parser.add_argument("--data_dir", type=str, default="datasets/femnist/", help="Path to the data directory, expected to have train and test directories with names trainpt and testpt respectively." )
     parser.add_argument("--loss_function", type=str, default="FocalLoss", help="Choose a loss function from the available options; CrossEntropyLoss, FocalLoss, HybridLoss")
-    parser.add_argument("--stratergy", type=str, default="ditto", help="Choose a federated learning stratergy from the available options; fedavg, fedprox, fedaboost")
+    parser.add_argument("--stratergy", type=str, default="fedavg", help="Choose a federated learning stratergy from the available options; fedavg, fedprox, fedaboost")
     parser.add_argument("--log_summary", action="store_true")
-    parser.add_argument("--global_rounds", type=int, default=50)
+    parser.add_argument("--global_rounds", type=int, default=100)
     parser.add_argument("--local_rounds", type=int, default=5)
     parser.add_argument("--save_ckpt", action="store_true")
     return parser.parse_args()
@@ -99,7 +102,8 @@ class Federation:
         global_rounds: int,
         stratergy: callable,
         learning_rate: float,
-        batch_size: int,
+        train_batch_size: int,
+        test_batch_size: int,
         weight_decay: float,
     ) -> None:
         
@@ -110,11 +114,12 @@ class Federation:
         self.global_rounds = global_rounds
         self.stratergy = stratergy
         self.learning_rate = learning_rate
-        self.batch_size = batch_size
+        self.train_batch_size = train_batch_size
+        self.test_batch_size = test_batch_size
         self.weight_decay = weight_decay
 
         if stratergy == "fedaboost-optima":
-            self.server = OptimaServer(global_rounds, stratergy, checkpt_path=checkpt_path)
+            self.server = BoostingServer(global_rounds, stratergy, checkpt_path=checkpt_path)
             self.server.init_model(model)
 
             # Set up the clients for fedaboost-optima server
@@ -124,7 +129,8 @@ class Federation:
                     torch.load(f"{train_data_dir}/{id}.pt"),
                     torch.load(f"{test_data_dir}/{id}.pt"),
                     self.loss_fn,
-                    self.batch_size,
+                    self.train_batch_size,
+                    self.test_batch_size,
                     self.learning_rate,
                     self.weight_decay,
                     local_model=self.model,
@@ -142,7 +148,8 @@ class Federation:
                     torch.load(f"{train_data_dir}/{id}.pt"),
                     torch.load(f"{test_data_dir}/{id}.pt"),
                     self.loss_fn,
-                    self.batch_size,
+                    self.train_batch_size,
+                    self.test_batch_size,
                     self.learning_rate,
                     self.weight_decay,
                     local_model=self.model,
@@ -159,12 +166,13 @@ class Federation:
                         train_dataset=torch.load(f"{train_data_dir}/{id}.pt"),
                         test_dataset=torch.load(f"{test_data_dir}/{id}.pt"),
                         loss_fn=self.loss_fn,
-                        batch_size=self.batch_size,
+                        train_batch_size=self.train_batch_size,
+                        test_batch_size=self.test_batch_size,
                         learning_rate=self.learning_rate,
                         weight_decay=self.weight_decay,
                         local_model=self.model,
-                        personal_learning_rate=self.learning_rate, 
-                        ditto_lambda=0.2,
+                        personal_learning_rate=0.001,
+                        ditto_lambda=0.1,
                         personalized=True,
                         checkpt_path=checkpt_path,
 
@@ -214,9 +222,11 @@ class Federation:
             )
 
 class Dataset(Enum):
+    CELEBA = "celeba"
     FEMNIST = "femnist"
     MNIST = "mnist"
     KV = "kv"
+    CIFAR10 = "cifar10"
 
 class Stratergy(Enum):
     FEDAVG = "fedavg"
@@ -281,26 +291,52 @@ if __name__ == "__main__":
         loss_fn = getattr(torch.nn, args.loss_function)()
     
     log_summary = args.log_summary
-    checkpt_path = f"checkpt/{stratergy}/{dataset.name}/epoch_{epochs}/{global_rounds}_rounds_{local_rounds}_epochs_per_round/"
+    checkpt_path = f"checkpt/{stratergy}/{dataset.name}/real_setup/v5/epoch_{epochs}/{global_rounds}_rounds_{local_rounds}_epochs_per_round/"
     client_ids = get_client_ids(train_data_dir)
 
     if args.dataset == Dataset.FEMNIST:
         model = FEMNISTNet(62)
         learning_rate = float(config['FEMNIST']['learning_rate'])
-        batch_size = int(config['FEMNIST']['batch_size'])
+        train_batch_size = int(config['FEMNIST']['train_batch_size'])
+        test_batch_size = int(config['FEMNIST']['test_batch_size'])
         weight_decay = float(config['FEMNIST']['weight_decay'])
         num_classes = int(config['FEMNIST']['num_classes'])
-        training_samples = json.load(open(f"{data_dir}/training_samples.json"))
+        training_samples = json.load(open(f"{data_dir}/training_samples_v5.json"))
         alpha_constant = float(config['FEMNIST']['alpha_constant'])
+        alpha_max = int(config['FEMNIST']['alpha_max'])
+
+    elif args.dataset == Dataset.CELEBA:
+        model = CELEBANet()
+        learning_rate = float(config['CELEBA']['learning_rate'])
+        train_batch_size = int(config['CELEBA']['train_batch_size'])
+        test_batch_size = int(config['CELEBA']['test_batch_size'])
+        weight_decay = float(config['CELEBA']['weight_decay'])
+        num_classes = int(config['CELEBA']['num_classes'])
+        training_samples = json.load(open(f"{data_dir}/training_samples.json"))
+        alpha_constant = float(config['CELEBA']['alpha_constant'])
+        alpha_max = int(config['CELEBA']['alpha_max'])
 
     elif args.dataset == Dataset.MNIST:
         model = MNISTNet()
         learning_rate = float(config['MNIST']['learning_rate'])
-        batch_size = int(config['MNIST']['batch_size'])
+        train_batch_size = int(config['MNIST']['train_batch_size'])
+        test_batch_size = int(config['MNIST']['test_batch_size'])
         weight_decay = float(config['MNIST']['weight_decay'])
         num_classes = int(config['MNIST']['num_classes'])
-        training_samples = json.load(open(f"{data_dir}/training_samples_ctrl_experiment_100.json"))
+        training_samples = json.load(open(f"{data_dir}/training_samples.json"))
         alpha_constant = float(config['MNIST']['alpha_constant'])
+        alpha_max = int(config['MNIST']['alpha_max'])
+
+    elif args.dataset == Dataset.CIFAR10:
+        model = CIFAR10Net()
+        learning_rate = float(config['CIFAR10']['learning_rate'])
+        train_batch_size = int(config['CIFAR10']['train_batch_size'])
+        test_batch_size = int(config['CIFAR10']['test_batch_size'])
+        weight_decay = float(config['CIFAR10']['weight_decay'])
+        num_classes = int(config['CIFAR10']['num_classes'])
+        training_samples = json.load(open(f"{data_dir}/training_samples.json"))
+        alpha_constant = float(config['CIFAR10']['alpha_constant'])
+        alpha_max = int(config['CIFAR10']['alpha_max'])
 
     elif args.dataset == Dataset.KV:
         model = ShallowNN(176)
@@ -315,7 +351,8 @@ if __name__ == "__main__":
         global_rounds,
         stratergy,
         learning_rate,
-        batch_size,
+        train_batch_size,
+        test_batch_size,
         weight_decay,
     )
 
@@ -327,7 +364,7 @@ if __name__ == "__main__":
     logging.info(f"Loss function: {loss_fn}")
     logging.info(f"Stratergy: {stratergy}")
     logging.info(f"Learning rate: {learning_rate}")
-    logging.info(f"Batch size: {batch_size}")
+    logging.info(f"Batch size: {train_batch_size}")
     logging.info(f"Weight decay: {weight_decay}")
     logging.info(f"Checkpoint path: {checkpt_path}")
     logging.info(f"Special Notes: ")

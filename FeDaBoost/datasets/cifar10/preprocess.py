@@ -1,124 +1,162 @@
-"""
-Copyright (C) [2023] [Tharuka Kasthuriarachchige]
-
-This program is free software: you can redistribute it and/or modify
-it under the terms of the GNU General Public License as published by
-the Free Software Foundation, either version 3 of the License, or
-(at your option) any later version.
-
-This program is distributed in the hope that it will be useful,
-but WITHOUT ANY WARRANTY; without even the implied warranty of
-MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-GNU General Public License for more details.
-
-You should have received a copy of the GNU General Public License
-along with this program.  If not, see <https://www.gnu.org/licenses/>.
-
-Paper: [FeDABoost: AdaBoost Enhanced Federated Learning]
-Published in: 
-"""
 import numpy as np
 import pickle
 import cv2
 import os
 import argparse
 
-from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelBinarizer
 from sklearn.model_selection import train_test_split
 
-import torch
-from torch.utils.data import Dataset
-from torch.utils.data import ConcatDataset
-
 from imutils import paths
 
-def load(paths, verbose=-1):
+import torch
+from torch.utils.data import Dataset
+
+class_mapping = {
+    "airplane": 0,
+    "automobile": 1,
+    "bird": 2,
+    "cat": 3,
+    "deer": 4,
+    "dog": 5,
+    "frog": 6,
+    "horse": 7,
+    "ship": 8,
+    "truck": 9
+}
+
+def load(paths, verbose=-1)-> tuple:
     """
     Loads the images and labels from disk.
 
     Parameters:
     ------------
-    paths: list of image paths
-    verbose: whether to display progress
+    paths: list of image paths.
+    verbose: whether to display progress.
 
     Returns:
     ------------
-        tuple of images and labels
+        tuple of images and labels.
     """
     data = list()
     labels = list()
 
     for (i, imgpath) in enumerate(paths):    
-        im_gray = cv2.imread(imgpath , cv2.IMREAD_GRAYSCALE)
-        image = np.array(im_gray).flatten() 
-        label = imgpath.split(os.path.sep)[-2]
-        data.append(image/255)
+        # Load the image in color (or grayscale if that's what you intend)
+        im_color = cv2.imread(imgpath, cv2.IMREAD_COLOR)
+        im_rgb = cv2.cvtColor(im_color, cv2.COLOR_BGR2RGB)
+        image = np.array(im_rgb).flatten()
+        
+        # Extract the label from the file path and map to an integer
+        label_str = imgpath.split(os.path.sep)[-2]
+        label = class_mapping[label_str]
+        
+        data.append(image / 255.0)
         labels.append(label)
+        
         if verbose > 0 and i > 0 and (i + 1) % verbose == 0:
             print("[INFO] processed {}/{}".format(i + 1, len(paths)))
 
     return data, labels
 
-def create_clients(image_list, label_list, num_clients=20, initial='clients', save_dir='client_data', batch_size=32):
+def create_clients(image_list: list, label_list: list, num_clients: int, initial: str, save_dir: str, batch_size: int) -> dict:
     """
     Create clients using the given images and labels, and save each client's data into a directory.
+    This version splits the sorted data (skewed by class) into many shards, assigns several shards per client,
+    and then ensures that each client has at least two different classes by swapping shards if needed.
     
     Parameters:
     ------------
-    image_list: list of numpy arrays
-    label_list: list of binary labels
-    num_clients: number of clients (default=20)
-    initial: client name prefix
-    save_dir: the base directory to save client data
+    image_list: list of numpy arrays.
+    label_list: list of binary labels (assumed one-hot).
+    num_clients: number of clients to create.
+    initial: client name prefix (e.g., 'client').
+    save_dir: the base directory to save client data.
+    batch_size: minimum batch size requirement per client.
     
     Returns:
     ------------
-    clients: dictionary of client data
+    clients: dictionary of client data.
     """
-    
-    # Ensure the save directory exists
+    import os
+    import pickle
+    import numpy as np
+    import random
+
     if not os.path.exists(save_dir):
         os.makedirs(save_dir)
 
     print(f"Attempting to create {num_clients} clients from {len(image_list)} samples.")
 
+    # Compute the class index for each sample.
     max_y = np.argmax(label_list, axis=-1)
     sorted_zip = sorted(zip(max_y, label_list, image_list), key=lambda x: x[0])
-    data = [(x, y) for _, y, x in sorted_zip]
+    data = [(x, y, cls) for cls, y, x in sorted_zip]
 
-    # Ensure each client gets at least one batch-sized dataset
-    min_client_size = max(batch_size*2, 1)  # At least one sample per client
+    # Minimum number of samples each client 
+    min_client_size = max(batch_size * 2, 1)
     max_clients_possible = len(data) // min_client_size
-
     if num_clients > max_clients_possible:
         print(f"Reducing clients from {num_clients} to {max_clients_possible} to ensure batch-size allocation.")
         num_clients = max_clients_possible
-    print(num_clients)
 
-    client_names = ['{}_{}'.format(initial, i+1) for i in range(num_clients)]
-    print(client_names)
+    client_names = [f"{initial}_{i+1}" for i in range(num_clients)]
+    print("Client names:", client_names)
 
-    size = len(data) // num_clients
-    shards = [data[i:i + size] for i in range(0, size * num_clients, size)]
-    assert len(shards) == len(client_names)
+    num_shards = 4 * num_clients
+    shard_size = len(data) // num_shards
+    shards = [data[i * shard_size: (i + 1) * shard_size] for i in range(num_shards)]
 
-    # Create dictionary for clients and save data
+    random.shuffle(shards)
+
+    # Assign shards to clients in a round-robin fashion.
+    clients_shards = {client: [] for client in client_names}
+    for i, shard in enumerate(shards):
+        client = client_names[i % num_clients]
+        clients_shards[client].append(shard)
+
+    def get_client_classes(shard_list):
+        """
+        Get set of classes for a client's assigned shards.
+        """
+        return set(shard[0][2] for shard in shard_list if shard)
+
+    # Check each client and ensure it has at least two different classes.
+    for client in client_names:
+        client_classes = get_client_classes(clients_shards[client])
+        if len(client_classes) < 2:
+            # Check for shard in another client to swap that brings in a new class.
+            for other in client_names:
+                if other == client:
+                    continue
+                for j, other_shard in enumerate(clients_shards[other]):
+                    other_class = other_shard[0][2] if other_shard else None
+                    if other_class not in client_classes:
+                        # Swap one shard with this shard.
+                        clients_shards[client][0], clients_shards[other][j] = clients_shards[other][j], clients_shards[client][0]
+                        client_classes = get_client_classes(clients_shards[client])
+                        break
+                if len(client_classes) >= 2:
+                    break
+            if len(client_classes) < 2:
+                print(f"Warning: Client {client} could not get at least two different classes.")
+
+    # Combine shards for each client.
     clients = {}
-    for i, client_name in enumerate(client_names):
-        client_data = shards[i]
-        clients[client_name] = client_data
-        
-        # Save the data
-        file_name = str(client_name)+ '.pkl'
+    for client in client_names:
+        client_data = [item for shard in clients_shards[client] for item in shard]
+        client_data = [(img, label) for img, label, cls in client_data]
+        clients[client] = client_data
+
+        # Save client data.
+        file_name = f"{client}.pkl"
         with open(os.path.join(save_dir, file_name), 'wb') as f:
             pickle.dump(client_data, f)
 
-    print(f"Successfully created {num_clients} clients, each with at least {batch_size} samples.")
-    
+    print(f"Successfully created {num_clients} clients, each with at least two different classes and a skewed distribution.")
     return clients
 
-class MNISTDataset(Dataset):
+class CIFARDataset(Dataset):
     """
     Custom dataset class for the training and validation dataset.
     """
@@ -151,6 +189,7 @@ class MNISTDataset(Dataset):
         """
         image, label = self.data[idx]
         return torch.tensor(image, dtype=torch.float32), torch.tensor(label, dtype=torch.long)
+
     
     def num_classes(self) -> int:
         """
@@ -164,10 +203,7 @@ class MNISTDataset(Dataset):
         labels = [label for _, label in self.data]
         unique_classes = torch.unique(torch.tensor(labels))
         return len(unique_classes)
-    
 
-
-    
 def build_dataset(data_dir, saving_dir) -> None:
     """
     Split the pickles into train and test, saving as a PyTorch dataset with stratified split.
@@ -195,17 +231,12 @@ def build_dataset(data_dir, saving_dir) -> None:
         with open(pickle_file, 'rb') as f:
             data = pickle.load(f)
 
-        # Extract labels for stratification
-        labels = [label for _, label in data]  # Assuming data is a list of (image, label) tuples
-
-        # Perform stratified split to ensure class balance
+        labels = [label for _, label in data]  
         train_data, test_data = train_test_split(data, test_size=0.2, random_state=42, stratify=labels)
 
-        # Create the datasets
-        train_dataset = MNISTDataset(train_data)
-        test_dataset = MNISTDataset(test_data)
+        train_dataset = CIFARDataset(train_data)
+        test_dataset = CIFARDataset(test_data)
 
-        # Save the datasets
         trainpt_dir = os.path.join(saving_dir, "trainpt")
         testpt_dir = os.path.join(saving_dir, "testpt")
         
@@ -220,9 +251,9 @@ def build_dataset(data_dir, saving_dir) -> None:
         print(f"Saved {os.path.join(trainpt_dir, f'{id}.pt')} and {os.path.join(testpt_dir, f'{id}.pt')}")
 
 def main():
-    parser = argparse.ArgumentParser(description="Preprocess the MNIST dataset.")
+    parser = argparse.ArgumentParser(description="Preprocess the CIFAR dataset.")
     parser.add_argument("--num_clients", type=int, default=1000)
-    parser.add_argument("--image_path", type=str, default="/Users/tak/Documents/BTH/MNIST/trainingSet")
+    parser.add_argument("--image_path", type=str, default="/Users/tak/Documents/BTH/cifar10")
     args = parser.parse_args()
 
     image_path = args.image_path
@@ -239,8 +270,8 @@ def main():
                                                         test_size=0.1, 
                                                         random_state=42)
 
-    create_clients(X_train, y_train, num_clients=args.num_clients, initial='client')
-    build_dataset("/Users/tak/Documents/BTH/FeDABoost/FeDaBoost/datasets/mnist/client_data", "/Users/tak/Documents/BTH/FeDABoost/FeDaBoost/datasets/mnist")
+    create_clients(X_train, y_train, num_clients=args.num_clients, initial='client', save_dir='client_data', batch_size=32)
+    build_dataset("/Users/tak/Documents/BTH/FeDABoost/FeDaBoost/datasets/cifar10/client_data", "/Users/tak/Documents/BTH/FeDABoost/FeDaBoost/datasets/cifar10")
 
 if __name__ == "__main__":
     main()
