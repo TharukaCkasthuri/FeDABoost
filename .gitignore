@@ -172,3 +172,4 @@ __pycache__/
 *.pkl
 *.pth
 *.pptx
+*.pdf
