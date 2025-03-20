@@ -3,6 +3,8 @@ import pickle
 import cv2
 import os
 import argparse
+import random
+
 
 from sklearn.preprocessing import LabelBinarizer
 from sklearn.model_selection import train_test_split
@@ -78,23 +80,18 @@ def create_clients(image_list: list, label_list: list, num_clients: int, initial
     ------------
     clients: dictionary of client data.
     """
-    import os
-    import pickle
-    import numpy as np
-    import random
-
     if not os.path.exists(save_dir):
         os.makedirs(save_dir)
 
     print(f"Attempting to create {num_clients} clients from {len(image_list)} samples.")
 
-    # Compute the class index for each sample.
+    # Compute the class index for each sample
     max_y = np.argmax(label_list, axis=-1)
     sorted_zip = sorted(zip(max_y, label_list, image_list), key=lambda x: x[0])
     data = [(x, y, cls) for cls, y, x in sorted_zip]
 
     # Minimum number of samples each client 
-    min_client_size = max(batch_size * 2, 1)
+    min_client_size = max(batch_size*3, 1)
     max_clients_possible = len(data) // min_client_size
     if num_clients > max_clients_possible:
         print(f"Reducing clients from {num_clients} to {max_clients_possible} to ensure batch-size allocation.")
@@ -156,6 +153,111 @@ def create_clients(image_list: list, label_list: list, num_clients: int, initial
     print(f"Successfully created {num_clients} clients, each with at least two different classes and a skewed distribution.")
     return clients
 
+def create_clients_dirichlet(
+    image_list: list,
+    label_list: list,
+    num_clients: int,
+    initial: str,
+    save_dir: str,
+    batch_size: int,
+    alpha: float = 0.5
+) -> dict:
+    """
+    Create clients using Dirichlet-based splitting without data duplication.
+    Clients with too few samples are merged, and their data is redistributed to other clients.
+
+    Parameters:
+    ------------
+    image_list: list of numpy arrays (flattened and normalized images).
+    label_list: list (or array) of labels. If one-hot, we take the argmax.
+    num_clients: number of clients to create.
+    initial: prefix for client names (e.g., 'client').
+    save_dir: directory to save client data.
+    batch_size: batch size for training (used to determine minimum sample needs).
+    alpha: Dirichlet concentration parameter. Lower alpha => more skewed distributions.
+
+    Returns:
+    ------------
+    clients: dict mapping client names to their (image, label) lists.
+    """
+
+    if not os.path.exists(save_dir):
+        os.makedirs(save_dir)
+
+    print(f"Creating {num_clients} clients from {len(image_list)} samples using Dirichlet(alpha={alpha})...")
+
+    # Convert one-hot labels to class indices if needed.
+    if hasattr(label_list, 'ndim') and label_list.ndim > 1 and label_list.shape[1] > 1:
+        max_y = np.argmax(label_list, axis=1)
+    else:
+        max_y = label_list
+
+    classes = np.unique(max_y)
+    class_indices = [np.where(max_y == c)[0] for c in classes]
+    client_data_indices = [[] for _ in range(num_clients)]
+
+    # Assign samples to clients using Dirichlet distribution
+    for c_indices in class_indices:
+        n_samples_for_class = len(c_indices)
+        if n_samples_for_class == 0:
+            continue
+
+        # Dirichlet sampling to determine class proportions per client
+        proportions = np.random.dirichlet([alpha] * num_clients)
+        counts = np.round(proportions * n_samples_for_class).astype(int)
+        
+        # Adjust counts to match total available samples
+        diff = n_samples_for_class - np.sum(counts)
+        while diff > 0:
+            idx = np.argmin(counts)
+            counts[idx] += 1
+            diff -= 1
+        while diff < 0:
+            idx = np.argmax(counts)
+            if counts[idx] > 0:
+                counts[idx] -= 1
+                diff += 1
+
+        # Shuffle class-specific indices and assign to clients
+        np.random.shuffle(c_indices)
+        start = 0
+        for client_id, count in enumerate(counts):
+            if count > 0:
+                selected = c_indices[start : start + count]
+                client_data_indices[client_id].extend(selected)
+                start += count
+
+    # Set minimum sample requirement
+    min_samples_required = 2 * batch_size
+    client_names = [f"{initial}_{i+1}" for i in range(num_clients)]
+    clients = {}
+    small_clients = []  # Stores clients that need merging
+
+    for i, client_name in enumerate(client_names):
+        indices = client_data_indices[i]
+        if len(indices) < min_samples_required:
+            print(f"Client {client_name} has {len(indices)} samples (requires {min_samples_required}), marking for merging.")
+            small_clients.extend(indices)  # Store samples for redistribution
+        else:
+            client_data = [(image_list[idx], label_list[idx]) for idx in indices]
+            file_name = os.path.join(save_dir, f"{client_name}.pkl")
+            with open(file_name, 'wb') as f:
+                pickle.dump(client_data, f)
+            clients[client_name] = client_data
+
+    # Redistribute samples from small clients
+    print("\nRedistributing samples from small clients to maintain total dataset size...\n")
+    valid_clients = list(clients.keys())
+    np.random.shuffle(valid_clients)  # Shuffle to distribute fairly
+
+    for idx in small_clients:
+        assigned_client = random.choice(valid_clients)  # Pick a valid client
+        clients[assigned_client].append((image_list[idx], label_list[idx]))  # Assign sample
+
+    print(f"\nSuccessfully created {len(clients)} clients while preserving dataset size ({len(image_list)} samples).")
+    return clients
+
+
 class CIFARDataset(Dataset):
     """
     Custom dataset class for the training and validation dataset.
@@ -188,8 +290,13 @@ class CIFARDataset(Dataset):
         y_train: torch.tensor object; label
         """
         image, label = self.data[idx]
-        return torch.tensor(image, dtype=torch.float32), torch.tensor(label, dtype=torch.long)
+        image = torch.tensor(image, dtype=torch.float32)
 
+        if image.shape[0] == 3072:  
+            image = image.view(32, 32, 3)
+
+        image = image.permute(2, 0, 1)
+        return image, torch.tensor(label, dtype=torch.long)
     
     def num_classes(self) -> int:
         """
@@ -224,26 +331,40 @@ def build_dataset(data_dir, saving_dir) -> None:
 
     if not os.path.exists(saving_dir):
         os.makedirs(saving_dir)
-        os.makedirs(os.path.join(saving_dir, "trainpt"))
-        os.makedirs(os.path.join(saving_dir, "testpt"))
+
+    trainpt_dir = os.path.join(saving_dir, "trainpt")
+    if not os.path.exists(trainpt_dir):
+        os.makedirs(trainpt_dir)
+
+    testpt_dir = os.path.join(saving_dir, "testpt")
+    if not os.path.exists(testpt_dir):
+        os.makedirs(testpt_dir)
 
     for id, pickle_file in zip(ids, files_path):
         with open(pickle_file, 'rb') as f:
             data = pickle.load(f)
 
-        labels = [label for _, label in data]  
-        train_data, test_data = train_test_split(data, test_size=0.2, random_state=42, stratify=labels)
+        labels = [label for _, label in data]
+        # Convert one-hot encoded labels to integer labels.
+        integer_labels = [np.argmax(label) for label in labels]
+
+        # Check if the client has at least two classes.
+        if len(set(integer_labels)) < 2:
+            print(f"Skipping client with id {id} because it only has one class: {set(integer_labels)}")
+            continue
+
+        try:
+            train_data, test_data = train_test_split(
+                data, test_size=0.2, random_state=42, stratify=integer_labels
+            )
+        except ValueError:
+            train_data, test_data = train_test_split(data, test_size=0.2, random_state=42)
+        except Exception as e:
+            print(f"Error processing client {id}: {e}")
+            continue
 
         train_dataset = CIFARDataset(train_data)
         test_dataset = CIFARDataset(test_data)
-
-        trainpt_dir = os.path.join(saving_dir, "trainpt")
-        testpt_dir = os.path.join(saving_dir, "testpt")
-        
-        if not os.path.exists(trainpt_dir):
-            os.makedirs(trainpt_dir)
-        if not os.path.exists(testpt_dir):
-            os.makedirs(testpt_dir)
 
         torch.save(train_dataset, os.path.join(trainpt_dir, f"{id}.pt"))
         torch.save(test_dataset, os.path.join(testpt_dir, f"{id}.pt"))
@@ -252,8 +373,9 @@ def build_dataset(data_dir, saving_dir) -> None:
 
 def main():
     parser = argparse.ArgumentParser(description="Preprocess the CIFAR dataset.")
-    parser.add_argument("--num_clients", type=int, default=1000)
+    parser.add_argument("--num_clients", type=int, default=0)
     parser.add_argument("--image_path", type=str, default="/Users/tak/Documents/BTH/cifar10")
+    parser.add_argument("--alpha", type=float, default=0.4)
     args = parser.parse_args()
 
     image_path = args.image_path
@@ -270,7 +392,12 @@ def main():
                                                         test_size=0.1, 
                                                         random_state=42)
 
-    create_clients(X_train, y_train, num_clients=args.num_clients, initial='client', save_dir='client_data', batch_size=32)
+    create_clients_dirichlet(image_list, label_list, num_clients=args.num_clients,
+               initial='client',
+               save_dir='client_data',
+               batch_size=32,
+               alpha=args.alpha)
+    #create_clients(X_train, y_train, num_clients=args.num_clients, initial='client', save_dir='client_data', batch_size=32)
     build_dataset("/Users/tak/Documents/BTH/FeDABoost/FeDaBoost/datasets/cifar10/client_data", "/Users/tak/Documents/BTH/FeDABoost/FeDaBoost/datasets/cifar10")
 
 if __name__ == "__main__":

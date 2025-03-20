@@ -20,6 +20,7 @@ Published in:
 
 import torch
 from typing import List
+import torch.nn.functional as F
 
 def fedAvg(global_model: torch.nn.Module, local_models: List[torch.nn.Module]) -> torch.nn.Module:
     """
@@ -27,15 +28,12 @@ def fedAvg(global_model: torch.nn.Module, local_models: List[torch.nn.Module]) -
 
     Parameters:
     ------------
-    global_model: torch.nn.Module object;
-        Global model.
-    local_models: list;
-        List of local models.
+    global_model: torch.nn.Module object; Global model.
+    local_models: list; List of local models.
 
     Returns:
     ------------
-    global_model: torch.nn.Module object;
-        Updated global model.
+    global_model: torch.nn.Module object; Updated global model.
     """
     # update global model parameters here
     state_dicts = [model.state_dict() for model in local_models]
@@ -55,12 +53,9 @@ def fedProx(global_model: torch.nn.Module, local_models: List[torch.nn.Module], 
 
     Parameters:
     ------------
-    global_model: torch.nn.Module object
-        Global model.
-    local_models: list
-        List of local models.
-    mu: float
-        Proximal term coefficient.
+    global_model: torch.nn.Module object; global model.
+    local_models: list; List of local models.
+    mu: float; Proximal term coefficient.
 
     Returns:
     ------------
@@ -87,7 +82,39 @@ def fedProx(global_model: torch.nn.Module, local_models: List[torch.nn.Module], 
     
     return global_model
 
+
 def weighted_avg(global_model: torch.nn.Module, local_models: List[torch.nn.Module], weights: List[float]) -> torch.nn.Module:
+    """
+    Average model parameters using weighted averaging.
+    
+    Parameters:
+    ------------
+    global_model: torch.nn.Module object
+        Global model.
+    local_models: list
+        List of local models.
+    weights: list
+        List of weights for each local model.
+    
+    Returns:
+    ------------
+    global_model: torch.nn.Module object
+        Updated global model.
+    """
+
+    state_dicts = [model.state_dict() for model in local_models]
+
+    with torch.no_grad():  
+        for key in global_model.state_dict().keys():
+            stacked_params = torch.stack(
+                [state_dict[key] * weights[i] for i, state_dict in enumerate(state_dicts)], dim=0
+            )
+            global_model.state_dict()[key].copy_(stacked_params.sum(dim=0))  
+
+    return global_model
+
+
+def boosted_avg(global_model: torch.nn.Module, local_models: List[torch.nn.Module], weights: List[float]) -> torch.nn.Module:
     """
     Average model parameters using weighted averaging, ignoring clients with negative weights.
     
@@ -106,28 +133,27 @@ def weighted_avg(global_model: torch.nn.Module, local_models: List[torch.nn.Modu
         Updated global model.
     """
     
-    # Filter out clients with negative weights
     valid_indices = [i for i, w in enumerate(weights) if w > 0]
     if not valid_indices:
         raise ValueError("No clients with positive weights available for aggregation.")
     
     valid_models = [local_models[i] for i in valid_indices]
-    valid_weights = [weights[i] for i in valid_indices]
+    valid_weights_tensor = torch.tensor([weights[i] for i in valid_indices])
+    
+    # Normalize weights using softmax so that they sum to 1
+    valid_weights = F.softmax(valid_weights_tensor, dim=0).tolist()
     
     state_dicts = [model.state_dict() for model in valid_models]
-    normalized_weights = [w / sum(valid_weights) for w in valid_weights]
 
-    with torch.no_grad():  
+    with torch.no_grad():
         for key in global_model.state_dict().keys():
+            # Aggregate parameters from each model using the normalized weights
             stacked_params = torch.stack(
-                [state_dict[key] * normalized_weights[i] for i, state_dict in enumerate(state_dicts)], dim=0
+                [state_dict[key] * valid_weights[i] for i, state_dict in enumerate(state_dicts)], dim=0
             )
-            global_model.state_dict()[key].copy_(stacked_params.sum(dim=0))  
-
+            global_model.state_dict()[key].copy_(stacked_params.sum(dim=0))
+    
     return global_model
-
-
-
 
 """ 
 from copy import deepcopy

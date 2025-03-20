@@ -22,13 +22,14 @@ import torch
 import random
 import os
 import logging
+import copy
 
 import pandas as pd
 import numpy as np
 from sklearn.preprocessing import MinMaxScaler
 
 from clients import Client
-from aggregators import fedAvg, fedProx, weighted_avg
+from aggregators import fedAvg, fedProx, weighted_avg, boosted_avg
 from utils import get_alpha, get_weights, influence_alpha, adjust_local_epochs, get_device, z_scores
 
 from datasets.femnist.preprocess import FEMNISTDataset
@@ -48,6 +49,10 @@ class Server:
         Number of global rounds
     stratergy: callable;
         Averaging stratergy for federated learning.
+    checkpt_path: str;
+        Path to save checkpoints of the global model.
+    log_dir: str;
+        TensorBoard log directory.
     
     Methods:
     ----------------
@@ -55,20 +60,20 @@ class Server:
         Initialize the model for federated learning.
     connect_client(self, client: Client) -> None:
         Add a client for federated learning setup.
-    __aggregate(self, weights = []) -> None:
+    sample_clients(self, num_clients: int) -> dict:
+        Sample clients from the client dictionary.
+    _aggregate(self, trained_clients, weights = None) -> None:
         Aggregate the models of the clients.
-    _broadcast(self, model: torch.nn.Module) -> None:
+    _broadcast(self, model: torch.nn.Module, clients:list = None) -> None:
         Broadcast the model to the clients.
     _receive(self, client:callable) -> list:
         Receive the models from the clients.
-    train(self) -> None:
+    train(self, train_samples:dict, max_local_round:int, threshold:float, patience:int) -> torch.nn.Module:
         Train the model using federated learning.
+    __check_convergence(self, global_loss: float, prev_global_loss: float) -> bool:
+        Check if the training has converged.
     _collect_stats(self, local_loss: list, weights: list) -> dict:
-        Collect training statistics.
-    _save_stats(self, stats: list, path: str) -> None:
-        Save training statistics to a CSV file.
-    _check_model_update(self, prev_params: list, updated_params: list) -> bool:
-        Check if the model parameters have been updated.
+        Collect training statistics.        
     """
 
     def __init__(self,rounds:int, stratergy:callable, checkpt_path:str=None, log_dir:str = 'runs') -> None:
@@ -89,11 +94,7 @@ class Server:
         Parameters:
         ----------------
         model: torch.nn.Module object;
-            Model to be trained
-
-        Returns:
-        ----------------
-        None
+            The global model.
         """
         self.global_model = model
         self.global_model.train()
@@ -108,10 +109,6 @@ class Server:
         ----------------
         client_id: str;
             Client id
-
-        Returns:
-        ----------------
-        None
         """
         
         client_id = client.client_id
@@ -129,7 +126,7 @@ class Server:
 
         Returns:
         ----------------
-        list
+        sampled_clients: dict
             Dict of sampled clients
         """
         sampled_client_ids = np.random.choice(list(self.client_dict.keys()), num_clients, replace=False)
@@ -171,9 +168,7 @@ class Server:
             raise ValueError(f"Unsupported aggregation strategy: {self.stratergy}")
         
         self.global_model = aggregation_function(self.global_model, client_models, weights)
-
         updated_params = [p.clone() for p in self.global_model.parameters()]
-
         updated = self._check_model_update(prev_params, updated_params)
 
         return self.global_model, updated
@@ -195,7 +190,7 @@ class Server:
 
         for client_id, client in self.client_dict.items():
             if client_id in clients:
-                client.set_model(model_state_dict)
+                client.set_model(copy.deepcopy(model_state_dict))
                 self.client_dict[client_id] = client
                 print(f"Broadcasted model to client {client.client_id}")
 
@@ -369,10 +364,6 @@ class Server:
             Model at a specific checkpoint.
         ckptpath: str;
             Path to save the checkpoint. Default is None.
-
-        Returns:
-        ----------------
-        None
         """
         if os.path.exists(ckptpath):
             torch.save(
@@ -390,13 +381,18 @@ class BoostingServer(Server):
 
     """
     The federated learning server class for fedaboost.
-
     Parameters:
     ----------------
     rounds: int;
         Number of global rounds
-        stratergy: callable;
-        Averaging stratergy for federated learning.
+    stratergy: callable;
+        Aggregation stratergy for federated learning.
+    checkpt_path: str;
+        Path to save checkpoints of the global model.
+    log_dir: str;
+        TensorBoard log directory.
+    max_local_round: int;
+        Maximum number of local rounds for each client.
 
     Methods:
     ----------------
@@ -433,14 +429,14 @@ class BoostingServer(Server):
 
         prev_params = [p.clone() for p in self.global_model.parameters()]
         client_models = [client.get_model() for client in trained_clients.values()]
-        self.global_model = weighted_avg(self.global_model, client_models, weights)
+        self.global_model = boosted_avg(self.global_model, client_models, weights)
 
         updated_params = [p.clone() for p in self.global_model.parameters()]
         updated = self._check_model_update(prev_params, updated_params)
         return self.global_model, updated
 
 
-    def train(self, train_samples:dict, max_local_round:int, threshold:float, patience:int, alpha_constant) -> torch.nn.Module:
+    def train(self, train_samples:dict, max_local_round:int, threshold:float, patience:int) -> torch.nn.Module:
         """
         Train the model using federated learning.
 
@@ -456,12 +452,13 @@ class BoostingServer(Server):
         """
         consecutive_no_update_rounds = 0
 
-        weights_dict = {client: (1 / len(self.client_dict)) for client in self.client_dict}
+        weights_dict = {client: (1 / len(train_samples[str(1)])) for client in self.client_dict}
 
         for client in self.client_dict.values():
             client.set_weight(weights_dict[client.client_id])
 
         logging.info(f"Initial Weights: {weights_dict}")
+
         for round in range(1,self.rounds+1):
             update_status = False
 
@@ -472,16 +469,13 @@ class BoostingServer(Server):
             train_clients_list= train_samples[str(round)]
             k = len(train_clients_list)
             train_clients = {client: self.client_dict[client] for client in train_clients_list}
+            self._broadcast(self.global_model, train_clients.keys())
 
             for client in train_clients.values():
-                client.set_model(self.global_model.state_dict())
-                _, alpha = client.train(round, max_local_round,k,threshold, patience)
-
+                _, alpha = client.train(round, max_local_round, k, threshold, patience)
                 alphas[client.client_id] = alpha
                 #logging.info(f"Client {client.client_id} Alpha: {alpha}")
                 self._receive(client)
-
-
             logging.info(f"Alpha values used for aggregation: {alphas}")
 
             alpha_values = self.scaler.fit_transform(np.array(list(alphas.values())).reshape(-1, 1))
@@ -528,61 +522,13 @@ class DittoServer(Server):
     """
 
     def __init__(self, rounds: int, stratergy: callable, checkpt_path: str = None, log_dir: str = 'runs'):
-        # Call the parent constructor
         super().__init__(rounds, stratergy, checkpt_path, log_dir)
-        # Any additional Ditto-specific fields can be initialized here if needed
-        # For example: self.personal_models = {}  # If you wanted the server to track them
-
+  
     def train(self, train_samples: dict, max_local_round: int, threshold: float, patience: int) -> torch.nn.Module:
         """
         Overridden train method. The main difference for Ditto is that clients 
         (DittoClient) will internally train both the global model copy and their 
         personal model. The server side remains mostly the same as standard FL.
-
         """
-        consecutive_no_update_rounds = 0
-
-        for round_idx in range(1, self.rounds + 1):
-            print(f"\n | Global Training Round : {round_idx} |\n")
-            logging.info(f"\n | Global Training Round : {round_idx} |\n")
-
-            train_clients_list = train_samples[str(round_idx)]
-            train_clients = {cid: self.client_dict[cid] for cid in train_clients_list}
-            logging.info(f"Selected Clients: {train_clients.keys()}")
-
-            self._broadcast(self.global_model)
-
-            num_data_points = {}
-            for client in train_clients.values():
-                pre_loss, pre_f1 = client.evaluate()
-                
-                client.train(
-                    global_round=round_idx,
-                    max_local_round=max_local_round,
-                    threshold=threshold,
-                    patience=patience
-                )
-                
-                num_data_points[client.client_id] = client.get_num_datapoints()
-                self._receive(client)
-
-            total_data_points = sum(num_data_points[cid] for cid in train_clients)
-            weights = [num_data_points[cid] / total_data_points for cid in train_clients]
-            self.global_model, update_status = self._aggregate(train_clients, weights=weights)
-
-            ckpt_path = f"{self.checkpoint_path}/checkpoints/ckpt_{round_idx}.pt"
-            self.save_checkpt(self.global_model, ckpt_path)
-            print(f"Model Updated: {update_status}")
-
-            if not update_status:
-                consecutive_no_update_rounds += 1
-                print("The global model parameters have not been updated, so the training may be converging.")
-            else:
-                consecutive_no_update_rounds = 0
-
-            if consecutive_no_update_rounds == 5:
-                print("The global model parameters have not been updated for 5 consecutive rounds, stopping early.")
-                break
-
+        self.global_model = super().train(train_samples, max_local_round, threshold, patience)
         return self.global_model
-
