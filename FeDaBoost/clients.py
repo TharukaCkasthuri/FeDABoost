@@ -445,8 +445,7 @@ class BoostingClient(Client):
         ------------
         weight: float; weight
         """
-        
-        self.initial_weight = self.weight
+        self.initial_weight = weight
         self.weight = weight
         return self.weight
 

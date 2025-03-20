@@ -5,7 +5,7 @@ import argparse
 import configparser
 import numpy as np
 
-def sample_clients(client_ids: list, min_clients, max_clients) -> dict:
+def sample_clients(client_ids: list, client_fraction:float) -> dict:
     """
     Sample clients from the client dictionary.
 
@@ -19,7 +19,7 @@ def sample_clients(client_ids: list, min_clients, max_clients) -> dict:
     list
         Dict of sampled clients
     """
-    num_clients = random.randint(min_clients, max_clients)
+    num_clients = int(len(client_ids) * client_fraction)
     sampled_client_ids = np.random.choice(client_ids, num_clients, replace=False)
 
     return sampled_client_ids
@@ -38,7 +38,7 @@ def get_client_ids(folder_path):
 
 def parse_arguments():
     parser = argparse.ArgumentParser(description="Federated training parameters")
-    parser.add_argument("--dir", type=str, default="femnist", help="Choose a dataset from the available options; femnist, mnist, kv")
+    parser.add_argument("--dir", type=str, default="cifar10", help="Choose a dataset from the available options; femnist, mnist, kv, celeba, cifar10")
     return parser.parse_args()
 
 def load_config(config_path="../config.cfg"):
@@ -51,12 +51,11 @@ def main():
     folder_path = args.dir
     config = load_config()
 
-    min_clients = int(config['FEMNIST']['min_clients'])
-    max_clients = int(config['FEMNIST']['max_clients'])
+    client_fraction = float(config['CIFAR10']['client_fraction'])
 
     client_ids = get_client_ids(f"{folder_path}/trainpt")
 
-    training_samples = {i: sample_clients(client_ids, min_clients, max_clients) for i in range(1, 501)}
+    training_samples = {i: sample_clients(client_ids, client_fraction) for i in range(1, 501)}
     training_samples = {key: value.tolist() if isinstance(value, np.ndarray) else value for key, value in training_samples.items()}
     output_file = f"{folder_path}/training_samples.json"
 
