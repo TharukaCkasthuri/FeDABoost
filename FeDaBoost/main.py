@@ -26,6 +26,7 @@ import configparser
 from datetime import datetime
 from enum import Enum
 import torch
+import copy
 
 from clients import Client, BoostingClient, DittoClient
 from server import Server, BoostingServer, DittoServer
@@ -36,7 +37,6 @@ from models.femnist import FEMNISTNet
 from models.mnist import MNISTNet
 from models.celeba import CELEBANet
 from models.cifar10 import CIFAR10Net
-
 from evals import FocalLoss, HybridLoss
 
 from datasets.kv.preprocess import KVDataSet
@@ -65,10 +65,10 @@ def setup_logging(stratergy,dataset, timestamp):
 
 def parse_arguments():
     parser = argparse.ArgumentParser(description="Federated training parameters")
-    parser.add_argument("--dataset", type=dataset_enum, default="femnist", help="Choose a dataset from the available options; femnist, mnist, kv")
-    parser.add_argument("--data_dir", type=str, default="datasets/femnist/", help="Path to the data directory, expected to have train and test directories with names trainpt and testpt respectively." )
+    parser.add_argument("--dataset", type=dataset_enum, default="cifar10", help="Choose a dataset from the available options; femnist, mnist, kv")
+    parser.add_argument("--data_dir", type=str, default="datasets/cifar10/", help="Path to the data directory, expected to have train and test directories with names trainpt and testpt respectively.")
     parser.add_argument("--loss_function", type=str, default="FocalLoss", help="Choose a loss function from the available options; CrossEntropyLoss, FocalLoss, HybridLoss")
-    parser.add_argument("--stratergy", type=str, default="fedavg", help="Choose a federated learning stratergy from the available options; fedavg, fedprox, fedaboost")
+    parser.add_argument("--stratergy", type=str, default="fedaboost-optima", help="Choose a federated learning stratergy from the available options; fedavg, fedprox, fedaboost")
     parser.add_argument("--log_summary", action="store_true")
     parser.add_argument("--global_rounds", type=int, default=100)
     parser.add_argument("--local_rounds", type=int, default=5)
@@ -79,16 +79,31 @@ class Federation:
     """
     Class for federated learning.
 
-    Methods:
-    ----------
-    __init__(self, client_ids: list, model: torch.nn.Module, loss_fn:torch.nn.Module, global_rounds: int, stratergy: callable, local_rounds: int) -> None:
-        Initializes a Federation instance with the specified parameters.
-
-    train(self, model, summery=False) -> tuple:
-        Trains the model using federated learning.
-
-    save_stats(self, model, training_stat: list) -> None:
-        Saves the training statistics and the model.
+    Parameters:
+    ----------------
+    client_ids: list;
+        List of client ids.
+    model: torch.nn.Module;
+        Model to be trained.
+    loss_fn: torch.nn.Module;
+        Loss function.
+    train_data_dir: str;
+        Path to the training data directory.
+    test_data_dir: str;
+        Path to the testing data directory.
+    num_classes: int;
+        Number of classes in the dataset.
+    global_rounds: int;
+        Number of global rounds.
+    stratergy: callable;
+        Federated learning stratergy.
+    learning_rate: float;
+        Learning rate.
+    train_batch_size: int;
+        Batch size for training.
+    test_batch_size: int;
+        Batch size for testing.
+    weight_decay: float;    
     """
 
     def __init__(
@@ -152,11 +167,11 @@ class Federation:
                     self.test_batch_size,
                     self.learning_rate,
                     self.weight_decay,
-                    local_model=self.model,
+                    local_model= self.model,
                 ))
 
         elif stratergy == "ditto":
-            self.server = DittoServer(global_rounds, stratergy, checkpt_path=checkpt_path)
+            self.server = Server(global_rounds, stratergy, checkpt_path=checkpt_path)
             self.server.init_model(model)
 
             for id in client_ids:
@@ -181,7 +196,7 @@ class Federation:
         else:
                 raise ValueError(f"Invalid stratergy. Choose from: {', '.join([stratergy.value for stratergy in Stratergy])}")
 
-    def train(self, training_samples, max_local_round:int = 10, threshold:float = 0.01, patience = 2, alpha_constant=12) -> tuple:
+    def train(self, training_samples, max_local_round:int = 10, threshold:float = 0.01, patience = 2) -> tuple:
         """
         Training the federated learning model.
 
@@ -193,7 +208,7 @@ class Federation:
         print(threshold)
         print(type(threshold))
         if self.stratergy == "fedaboost-optima":
-            trained_model = self.server.train(training_samples, max_local_round, threshold, patience, alpha_constant)
+            trained_model = self.server.train(training_samples, max_local_round, threshold, patience)
         else:
             trained_model = self.server.train(training_samples, max_local_round, threshold, patience)
         return trained_model
@@ -272,7 +287,6 @@ if __name__ == "__main__":
     train_data_dir = f"{data_dir}/trainpt"
     test_data_dir = f"{data_dir}/testpt"
 
-
     # Warn if strategy is 'fedaboost-optima' or 'fedaboost-ranker' without 'FocalLoss'
     if args.stratergy in ["fedaboost-optima", "fedaboost-ranker"] and args.loss_function != "FocalLoss":
         warning_message = (
@@ -291,7 +305,7 @@ if __name__ == "__main__":
         loss_fn = getattr(torch.nn, args.loss_function)()
     
     log_summary = args.log_summary
-    checkpt_path = f"checkpt/{stratergy}/{dataset.name}/real_setup/v5/epoch_{epochs}/{global_rounds}_rounds_{local_rounds}_epochs_per_round/"
+    checkpt_path = f"checkpt/{stratergy}/{dataset.name}/real_setup/v1_/epoch_{epochs}/{global_rounds}_rounds_{local_rounds}_epochs_per_round/"
     client_ids = get_client_ids(train_data_dir)
 
     if args.dataset == Dataset.FEMNIST:
@@ -301,8 +315,7 @@ if __name__ == "__main__":
         test_batch_size = int(config['FEMNIST']['test_batch_size'])
         weight_decay = float(config['FEMNIST']['weight_decay'])
         num_classes = int(config['FEMNIST']['num_classes'])
-        training_samples = json.load(open(f"{data_dir}/training_samples_v5.json"))
-        alpha_constant = float(config['FEMNIST']['alpha_constant'])
+        training_samples = json.load(open(f"{data_dir}/training_samples_v6.json"))
         alpha_max = int(config['FEMNIST']['alpha_max'])
 
     elif args.dataset == Dataset.CELEBA:
@@ -312,8 +325,7 @@ if __name__ == "__main__":
         test_batch_size = int(config['CELEBA']['test_batch_size'])
         weight_decay = float(config['CELEBA']['weight_decay'])
         num_classes = int(config['CELEBA']['num_classes'])
-        training_samples = json.load(open(f"{data_dir}/training_samples.json"))
-        alpha_constant = float(config['CELEBA']['alpha_constant'])
+        training_samples = json.load(open(f"{data_dir}/training_samples_v1.json"))
         alpha_max = int(config['CELEBA']['alpha_max'])
 
     elif args.dataset == Dataset.MNIST:
@@ -324,7 +336,6 @@ if __name__ == "__main__":
         weight_decay = float(config['MNIST']['weight_decay'])
         num_classes = int(config['MNIST']['num_classes'])
         training_samples = json.load(open(f"{data_dir}/training_samples.json"))
-        alpha_constant = float(config['MNIST']['alpha_constant'])
         alpha_max = int(config['MNIST']['alpha_max'])
 
     elif args.dataset == Dataset.CIFAR10:
@@ -334,8 +345,7 @@ if __name__ == "__main__":
         test_batch_size = int(config['CIFAR10']['test_batch_size'])
         weight_decay = float(config['CIFAR10']['weight_decay'])
         num_classes = int(config['CIFAR10']['num_classes'])
-        training_samples = json.load(open(f"{data_dir}/training_samples.json"))
-        alpha_constant = float(config['CIFAR10']['alpha_constant'])
+        training_samples = json.load(open(f"{data_dir}/training_samples_20.json"))
         alpha_max = int(config['CIFAR10']['alpha_max'])
 
     elif args.dataset == Dataset.KV:
@@ -369,7 +379,7 @@ if __name__ == "__main__":
     logging.info(f"Checkpoint path: {checkpt_path}")
     logging.info(f"Special Notes: ")
     start = time.time()
-    trained_model = federation.train(training_samples, max_local_round=local_rounds, threshold=loss_threshould, patience=patience, alpha_constant=alpha_constant)
+    trained_model = federation.train(training_samples, max_local_round=local_rounds, threshold=loss_threshould, patience=patience)
     model_path = f"{checkpt_path}/global_model.pth"
     federation.save_models(trained_model, model_path)
     print(
