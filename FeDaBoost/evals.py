@@ -131,9 +131,11 @@ def evaluate_classification(
 
     loss_avg = sum(batch_loss) / len(batch_loss)
     f1_avg = f1_score(all_labels, all_preds, average='weighted')
+    f1_macro = f1_score(all_labels, all_preds, average='macro')
+
     accuracy = accuracy_score(all_labels, all_preds)
 
-    return loss_avg, f1_avg, accuracy
+    return loss_avg, f1_avg, accuracy, f1_macro
 
 def evaluate_mae_with_confidence(
     model: torch.nn.Module,
@@ -222,15 +224,6 @@ def performance(loss_fn, ckpt,testdata, ids):
 
 class FocalLoss(torch.nn.Module):
     def __init__(self, alpha=1, gamma=2, reduction='mean'):
-        """
-        Focal Loss implementation.
-
-        Parameters:
-        ------------
-        alpha: float; balancing factor for class imbalance (default=1)
-        gamma: float; focusing parameter to adjust the rate at which easy examples are down-weighted (default=2)
-        reduction: str; reduction method to apply to output ('mean', 'sum', or 'none')
-        """
         super(FocalLoss, self).__init__()
         self.alpha = alpha
         self.gamma = gamma
@@ -238,26 +231,30 @@ class FocalLoss(torch.nn.Module):
 
     def forward(self, inputs, targets):
         if inputs.dim() > 2:
-            inputs = inputs.view(inputs.size(0), inputs.size(1), -1)  
-            inputs = inputs.permute(0, 2, 1) 
-            inputs = inputs.contiguous().view(-1, inputs.size(-1))  
+            inputs = inputs.view(inputs.size(0), inputs.size(1), -1)
+            inputs = inputs.permute(0, 2, 1).contiguous().view(-1, inputs.size(-1))
         targets = targets.view(-1)
 
         log_pt = F.log_softmax(inputs, dim=-1)
-        pt = torch.exp(log_pt)  
-        log_pt = log_pt.gather(1, targets.view(-1, 1)).squeeze() 
-        pt = pt.gather(1, targets.view(-1, 1)).squeeze()  
+        pt = torch.exp(log_pt)
 
-        focal_loss = -self.alpha * (1 - pt) ** self.gamma * log_pt
+        log_pt = log_pt.gather(1, targets.view(-1, 1)).squeeze()
+        pt = pt.gather(1, targets.view(-1, 1)).squeeze()
 
-        # Apply reduction method
+        pt = pt.clamp(min=1e-6, max=1.0)
+        log_pt = log_pt.clamp(min=-20.0, max=0.0)
+
+        # Safe modulator clamp
+        modulator = (1 - pt).clamp(min=1e-6, max=1.0) ** self.gamma
+        focal_loss = -self.alpha * modulator * log_pt
+
         if self.reduction == 'mean':
             return focal_loss.mean()
         elif self.reduction == 'sum':
             return focal_loss.sum()
         else:
             return focal_loss
-        
+
     def update_gamma(self, new_gamma):
         self.gamma = new_gamma
 

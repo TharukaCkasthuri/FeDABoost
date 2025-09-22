@@ -57,7 +57,7 @@ def main():
 
     training_samples = {i: sample_clients(client_ids, client_fraction) for i in range(1, 501)}
     training_samples = {key: value.tolist() if isinstance(value, np.ndarray) else value for key, value in training_samples.items()}
-    output_file = f"{folder_path}/training_samples.json"
+    output_file = f"{folder_path}/training_samples_60.json"
 
     with open(output_file, 'w') as f:
         json.dump(training_samples, f, indent=4)

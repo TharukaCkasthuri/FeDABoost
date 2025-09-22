@@ -101,6 +101,40 @@ def weighted_avg(global_model: torch.nn.Module, local_models: List[torch.nn.Modu
     global_model: torch.nn.Module object
         Updated global model.
     """
+    #w = torch.tensor(weights, dtype=torch.float32)
+    #weights = F.softmax(w, dim=0).tolist()
+
+    state_dicts = [model.state_dict() for model in local_models]
+
+    with torch.no_grad():  
+        for key in global_model.state_dict().keys():
+            stacked_params = torch.stack(
+                [state_dict[key] * weights[i] for i, state_dict in enumerate(state_dicts)], dim=0
+            )
+            global_model.state_dict()[key].copy_(stacked_params.sum(dim=0))  
+
+    return global_model
+
+def fedaboost_avg(global_model: torch.nn.Module, local_models: List[torch.nn.Module], weights: List[float]) -> torch.nn.Module:
+    """
+    Average model parameters using weighted averaging.
+    
+    Parameters:
+    ------------
+    global_model: torch.nn.Module object
+        Global model.
+    local_models: list
+        List of local models.
+    weights: list
+        List of weights for each local model.
+    
+    Returns:
+    ------------
+    global_model: torch.nn.Module object
+        Updated global model.
+    """
+    
+    #weights = [weight / sum(weights) for weight in weights]  # Normalize weights to sum to 1
 
     state_dicts = [model.state_dict() for model in local_models]
 
