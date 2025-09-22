@@ -23,14 +23,14 @@ import random
 import os
 import logging
 import copy
+import json
 
 import pandas as pd
 import numpy as np
 from sklearn.preprocessing import MinMaxScaler
 
 from clients import Client
-from aggregators import fedAvg, fedProx, weighted_avg, boosted_avg
-from utils import get_alpha, get_weights, influence_alpha, adjust_local_epochs, get_device, z_scores
+from aggregators import  fedProx, weighted_avg, fedaboost_avg
 
 from datasets.femnist.preprocess import FEMNISTDataset
 from datasets.mnist.preprocess import MNISTDataset
@@ -426,13 +426,13 @@ class BoostingServer(Server):
         updated: bool
             Indicates whether the global model was updated.
         """
-
+    
         prev_params = [p.clone() for p in self.global_model.parameters()]
-        client_models = [client.get_model() for client in trained_clients.values()]
-        self.global_model = boosted_avg(self.global_model, client_models, weights)
+        self.global_model = fedaboost_avg(self.global_model, trained_clients, weights)
 
         updated_params = [p.clone() for p in self.global_model.parameters()]
         updated = self._check_model_update(prev_params, updated_params)
+
         return self.global_model, updated
 
 
@@ -451,13 +451,14 @@ class BoostingServer(Server):
             Trained model
         """
         consecutive_no_update_rounds = 0
-
         weights_dict = {client: (1 / len(train_samples[str(1)])) for client in self.client_dict}
 
         for client in self.client_dict.values():
-            client.set_weight(weights_dict[client.client_id])
+            client.set_weight(1/10) #/len(train_samples[str(1)])
 
         logging.info(f"Initial Weights: {weights_dict}")
+
+        gamma_history = {}
 
         for round in range(1,self.rounds+1):
             update_status = False
@@ -472,21 +473,29 @@ class BoostingServer(Server):
             self._broadcast(self.global_model, train_clients.keys())
 
             for client in train_clients.values():
-                _, alpha = client.train(round, max_local_round, k, threshold, patience)
+                _, alpha, gamma = client.train(round, max_local_round, k, threshold, patience)
                 alphas[client.client_id] = alpha
-                #logging.info(f"Client {client.client_id} Alpha: {alpha}")
+                gamma_history[client.client_id] = gamma
                 self._receive(client)
             logging.info(f"Alpha values used for aggregation: {alphas}")
 
-            alpha_values = self.scaler.fit_transform(np.array(list(alphas.values())).reshape(-1, 1))
-            self.global_model, update_status = self.__aggregate(train_clients, np.array(list(alphas.values())))
 
+            # align the client order
+            client_ids = list(train_clients.keys())
+            alpha_list = [alphas[cid] for cid in client_ids]  # consistent ordering
+            #alpha_values = self.scaler.fit_transform(np.array(alpha_list).reshape(-1, 1)).flatten()
+
+            # Normalize alpha values to sum to 1, comment this later
+            alpha_tensor = torch.tensor(alpha_list, dtype=torch.float32)
+            alpha_values = torch.softmax(alpha_tensor, dim=0).numpy()  # weights sum to 1
+
+            client_models = [train_clients[cid].get_model() for cid in client_ids]
+            self.global_model, update_status = self.__aggregate(client_models, alpha_values)
+        
             self.save_checkpt(self.global_model, f"{self.checkpoint_path}/checkpoints/ckpt_{round}.pt")
 
             print(f"Model Updated: {update_status}")
             logging.info(f"Model Updated Successfully using Fedaboost weighted averaging: {update_status}")
-
-            self._broadcast(self.global_model)
             
             if not update_status:
                 consecutive_no_update_rounds += 1
@@ -499,6 +508,10 @@ class BoostingServer(Server):
                 print("The global model parameters have not been updated for 5 consecutive rounds, so the training has converged.")
                 logging.info("The global model parameters have not been updated for 3 consecutive rounds. Hence, stopping the training.")
                 break
+        
+        #pd.DataFrame(gamma_history).to_csv(f"{self.checkpoint_path}/gamma_history.csv", index=False)
+        with open(f"{self.checkpoint_path}/clients_gamma.json", 'w') as f:
+            json.dump(gamma_history, f, indent=4)
 
         return self.global_model
 

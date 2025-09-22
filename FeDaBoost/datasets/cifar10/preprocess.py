@@ -373,7 +373,7 @@ def build_dataset(data_dir, saving_dir) -> None:
 
 def main():
     parser = argparse.ArgumentParser(description="Preprocess the CIFAR dataset.")
-    parser.add_argument("--num_clients", type=int, default=0)
+    parser.add_argument("--num_clients", type=int, default=200)
     parser.add_argument("--image_path", type=str, default="/Users/tak/Documents/BTH/cifar10")
     parser.add_argument("--alpha", type=float, default=0.4)
     args = parser.parse_args()

@@ -63,13 +63,14 @@ class Client:
     ) -> None:
 
         self.client_id: str = client_id
-        self.loss_fn = loss_fn
+        self.loss_fn = copy.deepcopy(loss_fn)
         self.batch_size = train_batch_size
         self.device = get_device()
         self.local_model = local_model
         self.local_model = local_model.to(self.device)
         self.train_dataset = train_dataset
         self.datapoints = len(train_dataset)
+        
 
         self.traindl = DataLoader(
             train_dataset, train_batch_size, shuffle=True, drop_last=True
@@ -78,17 +79,31 @@ class Client:
         self.valdl = DataLoader(test_dataset, test_batch_size, shuffle=False, drop_last=True)
 
         if isinstance(self.train_dataset, CIFARDataset):
-            self.optimizer = torch.optim.Adam(
-                local_model.parameters(),
-                lr=learning_rate,
-                weight_decay=weight_decay,
-            )
+            self.optimizer = torch.optim.SGD(
+            local_model.parameters(),
+            lr=learning_rate,
+            weight_decay=weight_decay,
+            momentum=0.9,  # Momentum is often used in CIFAR-10 training
+            )            
         else:
             self.optimizer = torch.optim.SGD(
                 local_model.parameters(),
                 lr=learning_rate,
                 weight_decay=weight_decay,
             )
+        """ #temporary testing AdamW optimizer
+        self.optimizer = torch.optim.AdamW(
+                self.local_model.parameters(),
+                lr=0.00001,
+                weight_decay=1e-6,
+            )
+        """
+        #temporary testing AdamW optimizer
+        #self.optimizer = torch.optim.AdamW(
+        #        self.local_model.parameters(),
+        #        lr=0.0003,
+        #        weight_decay=1e-6,
+        #    )
         
 
     def get_num_datapoints(self) -> int:
@@ -105,8 +120,8 @@ class Client:
         ------------
         model_weights: dict; state dictionary of model weights
         """
-        print(f"Client: {self.client_id} \tReceiving global model...")
-        logging.info(f"Client: {self.client_id} \tReceiving global model...")
+        #print(f"Client: {self.client_id} \tReceiving global model...")
+        #logging.info(f"Client: {self.client_id} \tReceiving global model...")
         
         prev_weights = copy.deepcopy(self.local_model.state_dict())
         
@@ -117,7 +132,8 @@ class Client:
                 logging.warning(f"Client: {self.client_id} encountered update issues: missing_keys={update_status.missing_keys}, unexpected_keys={update_status.unexpected_keys}. Reverting to previous weights.")
                 self.local_model.load_state_dict(prev_weights)
             else:
-                logging.info(f"Client: {self.client_id} model updated successfully.")
+                pass
+                #logging.info(f"Client: {self.client_id} model updated successfully.")
         except Exception as e:
             logging.error(f"Client: {self.client_id} error during model update: {e}. Reverting to previous weights.")
             self.local_model.load_state_dict(prev_weights)
@@ -149,10 +165,11 @@ class Client:
         print(f"Client: {self.client_id} \tTraining...")
         logging.info(f"Client: {self.client_id} \tTraining...")
 
-        val_loss, val_f1 = self.evaluate()
-        print(f"Client: {self.client_id} \tInitial Validation Loss: {val_loss:.4f} \tInitial Validation F1: {val_f1:.4f}")
-        logging.info(f"Client: {self.client_id} \tInitial Validation Loss before training: {val_loss:.4f} \tInitial Validation F1: {val_f1:.4f}")
+        #val_loss, val_f1 = self.evaluate()
+        #print(f"Client: {self.client_id} \tInitial Validation Loss: {val_loss:.4f} \tInitial Validation F1: {val_f1:.4f}")
+        #logging.info(f"Client: {self.client_id} \tInitial Validation Loss before training: {val_loss:.4f} \tInitial Validation F1: {val_f1:.4f}")
 
+        self.local_model.train()
         for epoch in range(max_local_round):
             batch_loss = []
             for batch_idx, (x, y) in enumerate(self.traindl):
@@ -169,6 +186,7 @@ class Client:
                 loss = self.loss_fn(outputs, y)
                 self.local_model.zero_grad()
                 loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.local_model.parameters(), max_norm=1.0)
                 self.optimizer.step()
 
                 batch_loss.append(loss.item())
@@ -178,7 +196,7 @@ class Client:
             logging.info(f"Client: {self.client_id} \tEpoch: {epoch + 1} \tAverage Training Loss: {loss_avg} \tGlobal Round: {global_round}")
 
             # Dynamic loss reduction evaluation.
-            """
+            
             loss_reduction = previous_loss_avg - loss_avg
             if loss_reduction < threshold:
                 no_improvement_rounds += 1
@@ -193,11 +211,11 @@ class Client:
                 break
 
             previous_loss_avg = loss_avg
-            """
+            
 
-        val_loss, val_f1 = self.evaluate()
-        print(f"Client: {self.client_id} \t Updated Validation Loss: {val_loss:.4f} \tUpdated Validation F1: {val_f1:.4f}")
-        logging.info(f"Client: {self.client_id} \tUpdated Loss: {val_loss:.4f} \tUpdated Validation F1: {val_f1:.4f}")
+        #val_loss, val_f1 = self.evaluate()
+        #print(f"Client: {self.client_id} \t Updated Validation Loss: {val_loss:.4f} \tUpdated Validation F1: {val_f1:.4f}")
+        #logging.info(f"Client: {self.client_id} \tUpdated Loss: {val_loss:.4f} \tUpdated Validation F1: {val_f1:.4f}")
 
         return self.local_model
 
@@ -267,6 +285,8 @@ class BoostingClient(Client):
         weight_decay: float,
         local_model: object = None,
         num_classes: int = 10,
+        eta = 0.01,  # Boosting learning rate
+        error_threshold: float = 0.5,  # Error threshold for boosting
     ) -> None:
         
         super().__init__(
@@ -281,10 +301,45 @@ class BoostingClient(Client):
             local_model
         )
 
+        """
+        self.optimizer = torch.optim.AdamW(
+                self.local_model.parameters(),
+                lr=0.0002,
+                weight_decay=1e-6,
+            )
+        """
+        """
+        self.optimizer = torch.optim.SGD(
+            local_model.parameters(),
+            lr=learning_rate,
+            weight_decay=weight_decay,
+            momentum=0.9,  # Momentum is often used in CIFAR-10 training
+            )
+        """
+        self.optimizer = torch.optim.SGD(
+            local_model.parameters(),
+            lr=learning_rate,
+            weight_decay=weight_decay,
+            momentum=0.9,  # Momentum is used in CIFAR-10 training
+            nesterov=True,
+            )
+        
+        """
+        self.optimizer = torch.optim.SGD([
+                {'params': local_model.conv1.parameters(), 'lr': 0.005},
+                {'params': local_model.conv2.parameters(), 'lr': 0.005},
+                {'params': local_model.gn1.parameters(), 'lr': 0.005},
+                {'params': local_model.gn2.parameters(), 'lr': 0.005},
+                {'params': local_model.fc1.parameters(), 'lr': learning_rate},
+                {'params': local_model.fc2.parameters(), 'lr': learning_rate},
+            ], momentum=0.9, weight_decay=0.001, nesterov=True,)           
+        """
+
         self.loss_fn = copy.deepcopy(loss_fn)
-        self.eta = 0.1
-        self.error_threshold = 0.3
-        self.loss_fn.gamma = 0
+        self.eta = 0.01  # Boosting learning rate
+        self.eta = eta
+        self.error_threshold = error_threshold
+        self.loss_fn.gamma = 0.0
         self.num_classes = train_dataset.num_classes() if num_classes is None else num_classes
 
     def train(self, global_round, max_local_round,k, threshold=0.01, patience=2,) -> tuple:
@@ -304,6 +359,9 @@ class BoostingClient(Client):
         alpha: float; alpha weight for the client aggregation in server.
         """
 
+        previous_loss_avg = float('inf')  
+        no_improvement_rounds = 0  
+
         error_rate, alpha = self.get_alpha()
         logging.info(f"Client {self.client_id} error rate Before start training: {error_rate}")
         print(f"Client {self.client_id} alpha for boosting weights: {alpha}")
@@ -318,11 +376,9 @@ class BoostingClient(Client):
         if (error_rate > self.error_threshold):
             print(f"The client training is boosted by: {self.weight}")
             logging.info(f"The client training is boosted by weight: {self.weight}")
-            max_gamma = 4
-            target_gamma_increase = max_gamma/50  
+            max_gamma = 3
 
-            gamma_increment = target_gamma_increase * (self.weight / self.initial_weight)
-            new_gamma = min(self.loss_fn.gamma + gamma_increment, max_gamma)
+            new_gamma = min(self.loss_fn.gamma + self.weight, max_gamma)
             self.loss_fn.update_gamma(new_gamma)
             logging.info(f"Client {self.client_id} gamma for training: {self.loss_fn.gamma}")
         else:
@@ -333,14 +389,16 @@ class BoostingClient(Client):
         print(f"Client: {self.client_id} \tTraining...")
         logging.info(f"Client: {self.client_id} \tTraining...")
 
-        val_loss, val_f1 = self.evaluate()
-        print(f"Client: {self.client_id} \tInitial Validation Loss: {val_loss:.4f} \tInitial Validation F1: {val_f1:.4f}")
-        logging.info(f"Client: {self.client_id} \tInitial Validation Loss before training: {val_loss:.4f} \tInitial Validation F1: {val_f1:.4f}")
+        #val_loss, val_f1 = self.evaluate()
+        #print(f"Client: {self.client_id} \tInitial Validation Loss: {val_loss:.4f} \tInitial Validation F1: {val_f1:.4f}")
+        #logging.info(f"Client: {self.client_id} \tInitial Validation Loss before training: {val_loss:.4f} \tInitial Validation F1: {val_f1:.4f}")
 
+        self.local_model.train()
         for epoch in range(max_local_round):
             batch_loss = []
             for batch_idx, (x, y) in enumerate(self.traindl):
                 x, y = x.to(self.device), y.to(self.device)
+                self.optimizer.zero_grad() 
                 outputs = self.local_model(x)
 
                 if isinstance(self.train_dataset, FEMNISTDataset):
@@ -353,19 +411,20 @@ class BoostingClient(Client):
                     y = y.view(-1, 1)
 
                 loss = self.loss_fn(outputs, y)
-                self.local_model.zero_grad()
                 loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.local_model.parameters(), max_norm=1.0)
                 self.optimizer.step()
                 batch_loss.append(loss.item())
+
     
             loss_avg = sum(batch_loss) / len(batch_loss)    
             print(f"Client: {self.client_id} \tEpoch: {epoch + 1} \tAverage Training Loss: {loss_avg} \tGlobal Round: {global_round} \tGamma: {self.loss_fn.gamma}")
             logging.info(f"Client: {self.client_id} \tEpoch: {epoch + 1} \tAverage Training Loss: {loss_avg} \tGlobal Round: {global_round} \tGamma: {self.loss_fn.gamma}")
 
-            """
             # Dynamic loss reduction evaluation.
-            loss_reduction = previous_loss_avg - loss_avg
 
+            
+            loss_reduction = previous_loss_avg - loss_avg
             if loss_reduction < threshold:
                 no_improvement_rounds += 1
                 print(f"Loss reduction below threshold ({loss_reduction:.6f}). No improvement rounds: {no_improvement_rounds}")
@@ -379,62 +438,80 @@ class BoostingClient(Client):
                 break
 
             previous_loss_avg = loss_avg
-            """            
+            
+
         error_rate, alpha = self.get_alpha()
+        alpha = np.clip(alpha, -3, 3)
         logging.info(f"Client {self.client_id} error rate After training: {error_rate}")
-        val_loss, val_f1 = self.evaluate()
-        print(f"Client: {self.client_id} \t Updated Validation Loss: {val_loss:.4f} \tUpdated Validation F1: {val_f1:.4f}")
-        logging.info(f"Client: {self.client_id} \tUpdated Loss: {val_loss:.4f} \tUpdated Validation F1: {val_f1:.4f}")
+        #val_loss, val_f1 = self.evaluate()
+        #print(f"Client: {self.client_id} \t Updated Validation Loss: {val_loss:.4f} \tUpdated Validation F1: {val_f1:.4f}")
+        #logging.info(f"Client: {self.client_id} \tUpdated Loss: {val_loss:.4f} \tUpdated Validation F1: {val_f1:.4f}")
 
-        return self.local_model, alpha
+        return self.local_model, alpha, self.loss_fn.gamma
 
-    def __get_error_rate(self) -> float:
+    def __get_error_rate(self, use_macro_f1: bool = False) -> float:
         """
         Evaluate the model on the validation dataset and return the error rate.
 
+        Parameters:
+        ----------------
+        use_macro_f1: bool
+            If True, use 1 - macro F1 score as the error.
+            If False, use standard classification error rate.
+
         Returns:
-        ------------
-        error_rate: float; error rate (proportion of incorrect predictions)
+        ----------------
+        error_rate: float
+            Error rate (proportion of incorrect predictions or 1 - F1)
         """
+        self.local_model.eval()
+        device = self.device
+
         incorrect_preds = 0
         total_samples = 0
+        all_preds = []
+        all_labels = []
 
-        for _, (x, y) in enumerate(self.valdl):
-            x, y = x.to(self.device), y.to(self.device)
-            outputs = self.local_model(x)
+        with torch.no_grad():
+            for _, (x, y) in enumerate(self.valdl):
+                x, y = x.to(device), y.to(device)
+                outputs = self.local_model(x)
 
-            if isinstance(self.train_dataset, FEMNISTDataset):
-                y = y.view(-1)
-            elif isinstance(self.train_dataset, MNISTDataset):
-                y = torch.argmax(y, dim=1)
-            elif isinstance(self.train_dataset, CIFARDataset):
-                y = torch.argmax(y, dim=1)
-            else:
-                y = y.view(-1, 1)
+                # Convert one-hot to class index if needed
+                if y.dim() > 1:
+                    y = torch.argmax(y, dim=1)
+                else:
+                    y = y.view(-1)
 
-            preds = torch.argmax(outputs, dim=1)
+                preds = torch.argmax(outputs, dim=1)
 
-            incorrect_preds += (preds != y).sum().item()  
-            total_samples += y.size(0)  
+                all_preds.extend(preds.cpu().numpy())
+                all_labels.extend(y.cpu().numpy())
 
-        # Error rate as the proportion of incorrect predictions
-        error_rate = incorrect_preds / total_samples if total_samples > 0 else 0
+                incorrect_preds += (preds != y).sum().item()
+                total_samples += y.size(0)
+
+        if total_samples == 0:
+            return 1.0  # Assume total error if no samples
+
+        if use_macro_f1:
+            f1 = f1_score(all_labels, all_preds, average='macro')
+            error_rate = 1.0 - f1
+        else:
+            error_rate = incorrect_preds / total_samples
+
         return error_rate
+
     
-    def get_alpha(self, alpha_max=12) -> float:
+    def get_alpha(self) -> float:
         """
         Calculate adjusted weight (alpha) for the client in the FL setting,
         giving higher weights to clients with lower errors with the global model.
         """
-        error_rate = self.__get_error_rate()
+        error_rate = self.__get_error_rate(use_macro_f1=True)  # or False if you prefer
         eps = 1e-6
         error_rate = min(max(error_rate, eps), 1 - eps)
         alpha = np.log((1 - error_rate) / error_rate) + np.log(self.num_classes - 1)
-        
-        # this smoothing is used to prevent alpha from becoming too large, but when this happens boosting weight reduced.
-        # Scale alpha to be within [-alpha_max, alpha_max]
-        #alpha = alpha_max * (2 / (1 + np.exp(-alpha / alpha_max)) - 1)
-        #alpha = alpha_max * np.tanh(alpha / alpha_max)
         return error_rate, alpha
     
     def set_weight(self, weight:float) -> None:
@@ -445,7 +522,6 @@ class BoostingClient(Client):
         ------------
         weight: float; weight
         """
-        self.initial_weight = weight
         self.weight = weight
         return self.weight
 
@@ -457,6 +533,7 @@ class BoostingClient(Client):
         ------------
         weight: float; weight
         """
+        alpha = np.clip(alpha, -5, 5)  #Ensure alpha is not too small
         self.weight = self.weight * math.exp(float(self.eta) *  -float(alpha) * int(performance_indicator))
         return self.weight
 
@@ -578,9 +655,9 @@ class DittoClient(Client):
 
         self.personal_model.train()
 
-        eval_loss, eval_f1 = self.evaluate_personal_model()
-        print(f"Client (personal): {self.client_id} \tInitial Validation Loss: {eval_loss:.6f} \tValidation F1: {eval_f1:.6f}")
-        logging.info(f"Client (personal): {self.client_id} \tInitial Validation Loss: {eval_loss:.6f} \tValidation F1: {eval_f1:.6f}")
+        #eval_loss, eval_f1 = self.evaluate_personal_model()
+        #print(f"Client (personal): {self.client_id} \tInitial Validation Loss: {eval_loss:.6f} \tValidation F1: {eval_f1:.6f}")
+        #logging.info(f"Client (personal): {self.client_id} \tInitial Validation Loss: {eval_loss:.6f} \tValidation F1: {eval_f1:.6f}")
 
         for epoch in range(max_local_round*1):
             batch_losses = []
@@ -619,9 +696,9 @@ class DittoClient(Client):
             print(f"Client: {self.client_id} \tEpoch (personal): {epoch+1} \tAvg Loss: {avg_loss:.6f} \tGlobal Round: {global_round}")
             logging.info(f"Client: {self.client_id} \tEpoch (personal): {epoch+1} \tAvg Loss: {avg_loss:.6f} \tGlobal Round: {global_round}")
         
-        eval_loss, eval_f1 = self.evaluate_personal_model()
-        print(f"Client: {self.client_id} \tFinal Validation Loss: {eval_loss:.6f} \tValidation F1: {eval_f1:.6f}")
-        logging.info(f"Client: {self.client_id} \tFinal Validation Loss: {eval_loss:.6f} \tValidation F1: {eval_f1:.6f}")
+        #eval_loss, eval_f1 = self.evaluate_personal_model()
+        #print(f"Client: {self.client_id} \tFinal Validation Loss: {eval_loss:.6f} \tValidation F1: {eval_f1:.6f}")
+        #logging.info(f"Client: {self.client_id} \tFinal Validation Loss: {eval_loss:.6f} \tValidation F1: {eval_f1:.6f}")
     
     def evaluate_personal_model(self) -> tuple:
         """

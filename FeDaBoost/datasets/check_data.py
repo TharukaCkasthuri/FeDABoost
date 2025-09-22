@@ -115,11 +115,10 @@ def dataset_summary(clients: dict) -> dict:
     return summary
 
 
-
 def main():
 
-    parser = argparse.ArgumentParser(description="Preprocess the MNIST dataset.")
-    parser.add_argument("--data_dir", type=str, default="data/mnist", help="Path to the directory containing the pickled MNIST data.")
+    parser = argparse.ArgumentParser(description="")
+    parser.add_argument("--data_dir", type=str, default="cifar10/client_data", help="Path to the directory containing the pickled MNIST data.")
     args = parser.parse_args()
 
     data_dir = args.data_dir

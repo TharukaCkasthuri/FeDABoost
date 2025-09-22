@@ -391,9 +391,9 @@ def build_dataset(data_dir, saving_dir) -> None:
 
 def main():
     parser = argparse.ArgumentParser(description="Preprocess the MNIST dataset.")
-    parser.add_argument("--num_clients", type=int, default=500)
+    parser.add_argument("--num_clients", type=int, default=300)
     parser.add_argument("--image_path", type=str, default="/Users/tak/Documents/BTH/MNIST/trainingSet")
-    parser.add_argument("--alpha", type=float, default=0.1, help="Dirichlet alpha parameter")
+    parser.add_argument("--alpha", type=float, default=0.3, help="Dirichlet alpha parameter")
     args = parser.parse_args()
 
     image_path = args.image_path

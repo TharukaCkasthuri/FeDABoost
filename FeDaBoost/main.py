@@ -14,7 +14,6 @@ GNU General Public License for more details.
 You should have received a copy of the GNU General Public License
 along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-Paper: [FeDBee: AdaBoost Enhanced Federated Learning]
 Published in: 
 """
 import os
@@ -68,10 +67,10 @@ def parse_arguments():
     parser.add_argument("--dataset", type=dataset_enum, default="cifar10", help="Choose a dataset from the available options; femnist, mnist, kv")
     parser.add_argument("--data_dir", type=str, default="datasets/cifar10/", help="Path to the data directory, expected to have train and test directories with names trainpt and testpt respectively.")
     parser.add_argument("--loss_function", type=str, default="FocalLoss", help="Choose a loss function from the available options; CrossEntropyLoss, FocalLoss, HybridLoss")
-    parser.add_argument("--stratergy", type=str, default="fedaboost-optima", help="Choose a federated learning stratergy from the available options; fedavg, fedprox, fedaboost")
+    parser.add_argument("--stratergy", type=str, default="fedaboost", help="Choose a federated learning stratergy from the available options; fedavg, fedprox, fedaboost")
     parser.add_argument("--log_summary", action="store_true")
-    parser.add_argument("--global_rounds", type=int, default=100)
-    parser.add_argument("--local_rounds", type=int, default=5)
+    parser.add_argument("--global_rounds", type=int, default=30)
+    parser.add_argument("--local_rounds", type=int, default=10)
     parser.add_argument("--save_ckpt", action="store_true")
     return parser.parse_args()
 
@@ -120,6 +119,8 @@ class Federation:
         train_batch_size: int,
         test_batch_size: int,
         weight_decay: float,
+        eta: float,
+        error_threshold: float,
     ) -> None:
         
         self.client_ids = client_ids
@@ -132,12 +133,14 @@ class Federation:
         self.train_batch_size = train_batch_size
         self.test_batch_size = test_batch_size
         self.weight_decay = weight_decay
+        self.eta = eta
+        self.error_threshold = error_threshold
 
-        if stratergy == "fedaboost-optima":
+        if stratergy == "fedaboost":
             self.server = BoostingServer(global_rounds, stratergy, checkpt_path=checkpt_path)
             self.server.init_model(model)
 
-            # Set up the clients for fedaboost-optima server
+            # Set up the clients for fedaboost server
             for id in client_ids:
                 self.server.connect_client(BoostingClient(
                     id,
@@ -148,8 +151,10 @@ class Federation:
                     self.test_batch_size,
                     self.learning_rate,
                     self.weight_decay,
-                    local_model=self.model,
+                    local_model= copy.deepcopy(self.model),
                     num_classes=self.num_classes,
+                    eta=self.eta,
+                    error_threshold=self.error_threshold,
                 ))
 
         elif stratergy == "fedavg":
@@ -167,7 +172,7 @@ class Federation:
                     self.test_batch_size,
                     self.learning_rate,
                     self.weight_decay,
-                    local_model= self.model,
+                    local_model= copy.deepcopy(self.model),
                 ))
 
         elif stratergy == "ditto":
@@ -185,7 +190,7 @@ class Federation:
                         test_batch_size=self.test_batch_size,
                         learning_rate=self.learning_rate,
                         weight_decay=self.weight_decay,
-                        local_model=self.model,
+                        local_model=copy.deepcopy(self.model),
                         personal_learning_rate=0.001,
                         ditto_lambda=0.1,
                         personalized=True,
@@ -207,8 +212,8 @@ class Federation:
         """
         print(threshold)
         print(type(threshold))
-        if self.stratergy == "fedaboost-optima":
-            trained_model = self.server.train(training_samples, max_local_round, threshold, patience)
+        if self.stratergy == "fedaboost":
+            trained_model = self.server.train(training_samples, max_local_round, threshold=0.05, patience=5)
         else:
             trained_model = self.server.train(training_samples, max_local_round, threshold, patience)
         return trained_model
@@ -246,9 +251,8 @@ class Dataset(Enum):
 class Stratergy(Enum):
     FEDAVG = "fedavg"
     FEDPROX = "fedprox"
-    FEDABOOSTOPTIMA = "fedaboost-optima"
-    FEDABOOSTRANKER = "fedaboost-ranker"
-    FEDABOOSTCONCORD = "fedaboost-concord"
+    FEDABOOST = "fedaboost" 
+    DITTO = "ditto"
 
 def dataset_enum(dataset_str: str) -> str:
     """
@@ -287,8 +291,7 @@ if __name__ == "__main__":
     train_data_dir = f"{data_dir}/trainpt"
     test_data_dir = f"{data_dir}/testpt"
 
-    # Warn if strategy is 'fedaboost-optima' or 'fedaboost-ranker' without 'FocalLoss'
-    if args.stratergy in ["fedaboost-optima", "fedaboost-ranker"] and args.loss_function != "FocalLoss":
+    if args.stratergy in ["fedaboost"] and args.loss_function != "FocalLoss":
         warning_message = (
             f"Warning: The strategy '{args.stratergy}' is selected without using 'FocalLoss' as the loss function. "
             f"It is recommended to use 'FocalLoss' for better performance."
@@ -300,12 +303,12 @@ if __name__ == "__main__":
         loss_fn = HybridLoss(focal_alpha=1, focal_gamma=2, focal_weight=0.7)
     elif args.loss_function == "FocalLoss":
         logging.info("Using Focal Loss")
-        loss_fn = FocalLoss(alpha=1, gamma=0)
+        loss_fn = FocalLoss(alpha=1, gamma=0, reduction='mean')
     else:
         loss_fn = getattr(torch.nn, args.loss_function)()
     
     log_summary = args.log_summary
-    checkpt_path = f"checkpt/{stratergy}/{dataset.name}/real_setup/v1_/epoch_{epochs}/{global_rounds}_rounds_{local_rounds}_epochs_per_round/"
+    checkpt_path = f"checkpt/{stratergy}/{dataset.name}/new_exp/v5/epoch_{epochs}/{global_rounds}_rounds_{local_rounds}_epochs_per_round/"
     client_ids = get_client_ids(train_data_dir)
 
     if args.dataset == Dataset.FEMNIST:
@@ -315,8 +318,9 @@ if __name__ == "__main__":
         test_batch_size = int(config['FEMNIST']['test_batch_size'])
         weight_decay = float(config['FEMNIST']['weight_decay'])
         num_classes = int(config['FEMNIST']['num_classes'])
-        training_samples = json.load(open(f"{data_dir}/training_samples_v6.json"))
-        alpha_max = int(config['FEMNIST']['alpha_max'])
+        training_samples = json.load(open(f"{data_dir}/training_samples_v1.json"))
+        eta = float(config['FEMNIST']['eta'])
+        error_threshold = float(config['FEMNIST']['error_threshold'])
 
     elif args.dataset == Dataset.CELEBA:
         model = CELEBANet()
@@ -326,7 +330,7 @@ if __name__ == "__main__":
         weight_decay = float(config['CELEBA']['weight_decay'])
         num_classes = int(config['CELEBA']['num_classes'])
         training_samples = json.load(open(f"{data_dir}/training_samples_v1.json"))
-        alpha_max = int(config['CELEBA']['alpha_max'])
+        error_threshold = float(config['CELEBA']['error_threshold'])
 
     elif args.dataset == Dataset.MNIST:
         model = MNISTNet()
@@ -336,7 +340,8 @@ if __name__ == "__main__":
         weight_decay = float(config['MNIST']['weight_decay'])
         num_classes = int(config['MNIST']['num_classes'])
         training_samples = json.load(open(f"{data_dir}/training_samples.json"))
-        alpha_max = int(config['MNIST']['alpha_max'])
+        eta = float(config['MNIST']['eta'])
+        error_threshold = float(config['MNIST']['error_threshold'])
 
     elif args.dataset == Dataset.CIFAR10:
         model = CIFAR10Net()
@@ -345,8 +350,9 @@ if __name__ == "__main__":
         test_batch_size = int(config['CIFAR10']['test_batch_size'])
         weight_decay = float(config['CIFAR10']['weight_decay'])
         num_classes = int(config['CIFAR10']['num_classes'])
-        training_samples = json.load(open(f"{data_dir}/training_samples_20.json"))
-        alpha_max = int(config['CIFAR10']['alpha_max'])
+        training_samples = json.load(open(f"{data_dir}/training_samples_60.json"))
+        eta = float(config['CIFAR10']['eta'])
+        error_threshold = float(config['CIFAR10']['error_threshold'])
 
     elif args.dataset == Dataset.KV:
         model = ShallowNN(176)
@@ -364,6 +370,8 @@ if __name__ == "__main__":
         train_batch_size,
         test_batch_size,
         weight_decay,
+        eta=eta,
+        error_threshold=error_threshold,
     )
 
     print("Federation with clients " + ", ".join(client_ids))
